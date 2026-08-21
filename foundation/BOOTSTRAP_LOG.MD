@@ -24,7 +24,8 @@ before the next began:
 
 Every layer had a throwaway program in `/tmp` that exercised it before the
 layer was considered done. The final suite (`TEST_RUNNER.ASM`) consolidates
-those checks into 23 registered tests.
+those checks into 47 registered tests (23 foundation + 24 Kind Machine
+extension).
 
 ## Decisions and the reasoning behind them
 
@@ -144,10 +145,99 @@ These were caught by the verification discipline, not by luck:
 
 ## Verification status at handoff
 
-- `foundation/build.sh test` → `tests: 23 failed: 0`, exit code 0.
+- `foundation/build.sh test` → `tests: 47 failed: 0`, exit code 0.
 - Failure injection (deliberately broken assertion) → reported with the
   correct name and line, exit code 2.
 - Deliberate NULL dereference → `CRASH sig=11 rip=0x.. addr=0x0` on stderr,
   exit code 3, register snapshot captured.
 - `EXAMPLE.ASM` runs cleanly, exercising bootstrap, CPUID, the allocator,
   structured loops, formatted I/O, and guard-page mapping.
+
+---
+
+## Kind Machine extension (Layers 1.5, 2.5, 4.5, 5, 5.5)
+
+A second build phase added the mechanical primitives for a hardware-kind
+attention mechanism: bit-math primitives, a token vocabulary, a pattern lexer,
+the golden-ratio distance oracle, sparse structures, and attention scaffolding.
+The same bottom-up discipline applied — each layer was exercised by a
+throwaway program in `/tmp` before being wired into the smoke suite. 24 tests
+were added (23 → 47).
+
+### Bit math is the mandated standard
+
+Per the extension requirement, bit-level operations are the default, not an
+optimization: shifts over division, AND over modulo, `cmov`/`setcc` over
+branches in hot paths, and no floating point anywhere (the ladder is Q32.32).
+`BIT_MATH.INC` codifies this with single-instruction wrappers (`popcnt`,
+`lzcnt`, `tzcnt`) chosen specifically because they are defined for zero input
+— unlike `bsr`/`bsf` — which keeps callers branch-free.
+
+### The spec's Fibonacci ladder constants were wrong — exact values embedded
+
+The draft specification listed 43 Q32.32 constants for φ^-21..φ^21. Only the
+four for n = 0..3 match exact φ^n in Q32.32; the other 39 are incorrect (for
+example it gave φ^-1 = 0x5BCAA, where the exact Q32.32 value is 0x9E3779B9 —
+the well-known Knuth golden-ratio fixed-point constant). Rather than propagate
+the error, `FIBONACCI.INC` embeds the mathematically exact round-to-nearest
+values. The build-time monotonic audit (below) would have caught any residual
+drift, and the comparator tests use hand-computed expected rungs. This is the
+verification discipline working as intended: a spec table is an oracle, and
+oracles need checking too.
+
+### Assembler-time audits via `load`/`repeat`
+
+Two invariants are proven at assembly time by reading the emitted binary back
+with FASM's `load`: the lexer table's prefix-freeness (`LEXER_TABLE_AUDIT`,
+O(n²) pairwise) and the ladder's strict monotonicity. A malformed table fails
+the build naming the macro — the table cannot silently drift from the
+invariant its consumer relies on. This extends the foundation's STATIC_ASSERT
+philosophy from scalar constants to structured data.
+
+### FASM subtleties encountered (and worked around)
+
+- **`= `<>` bind tighter than `and` in `if`.** `(x and 0x8000) = 0` parses as
+  `x and (0x8000 = 0)`. The masked value must be materialized into an
+  intermediate `=`-constant before comparison.
+- **`&` in `if` does not short-circuit like a logical AND.** Compound
+  conditions are expressed with nested `if` instead of `A & B`.
+- **`rept` is preprocessor-time** and cannot see `=`-defined constants; loop
+  counts for it must come from `define`/`equ`. The assembler's `repeat`/`%`
+  (which *can* see assembler values) is used for the data audits.
+- **`while` does not break on an assignment inside its body.** A "break"
+  requires a done-flag incorporated into the loop condition.
+- **`cmov` cannot source an immediate**, so `BIT_MATH_MIN/MAX` take register
+  operands only (documented in their contracts).
+- **Binary literals `0b...`** collided with FASM's tokenizer in one context;
+  decimal/hex used instead.
+
+### Bugs found by the extension's own tests
+
+1. **Lexer MASKQ bit-vs-byte count.** The buffer mask was computed as
+   `(1<<pos)-1` (bits) where `(1<<(pos*8))-1` (bytes) was required; the first
+   partial-pattern byte fell through to raw passthrough. Caught by the ELF
+   prefix test returning 127 instead of `LEXER_MORE`.
+2. **PREMIX_2x2 output aliasing.** Storing each output register as soon as its
+   product was formed clobbered a later term's operand when an output aliased
+   an input. Fixed by accumulating all four products in scratch registers and
+   writing outputs last — the macro is now alias-safe by construction.
+3. **ATTENTION_PRUNE_POSITION register capture.** The macro shadowed the
+   caller's row pointers across the `fp$closecheck_compare` call; fixed by
+   capturing them into preserved registers (`rbx`, saved `rdx`) before the
+   loop. Caught by a segfault in the mock-attention test.
+4. **Pre-existing `ASSERT_IN_RANGE` label collision.** Its `.fail` label was
+   not `local`, so a second use in one test redefined the symbol. Fixed to
+   `local .fail` — required by the multi-range token test.
+
+### Deferred by design (scaffolding seams)
+
+- `ATTENTION_PRUNE_POSITION` reads a caller-supplied score row; the QKᵀ GEMM
+  that would *produce* those scores is a deliberate seam for a future SIMD
+  library, so the loop structure is testable now and the multiply path can be
+  swapped without touching it.
+- The comparator uses one `div` for the relative gap (correctness first). A
+  reciprocal-multiply (Newton-Raphson) refinement is the documented
+  optimization path; the `bsr`-guided index already removes the log-search.
+- Masks wider than 64 bits are handled as qword arrays at the call site
+  (index `shr 6` for the word, `and 63` for the bit); a dedicated wide-mask
+  macro set is future work.

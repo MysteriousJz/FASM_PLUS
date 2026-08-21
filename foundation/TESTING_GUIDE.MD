@@ -19,14 +19,14 @@ echo $?                       # 0 = all pass
 A passing run ends with:
 
 ```
-tests: 23 failed: 0
+tests: 47 failed: 0
 ```
 
 A failing run prints one line per failure and a non-zero summary:
 
 ```
 FAIL mem_copy_roundtrip line 118
-tests: 23 failed: 1
+tests: 47 failed: 1
 ```
 
 The number after `line` is the source line of the failing assertion.
@@ -111,6 +111,44 @@ For a whole new layer (e.g. data structures):
    runner).
 3. Register every test in `TEST_RUNNER.ASM`.
 4. Keep the rules: independent, deterministic, isolated, self-reporting.
+
+## Testing the Kind Machine extension (Layers 1.5–5.5)
+
+The extension layers add compile-time machinery alongside runtime code, so
+their tests split into two kinds:
+
+**Compile-time checks** run at assembly time and fail the *build*, not a test.
+`TOKEN_IS_UNIQUE`, `LEXER_TABLE_AUDIT`, and the `fib_ladder` monotonic audit
+are examples — if they fire, `build.sh` reports an assembler error naming the
+macro and line. There is nothing to register for these; including the file
+and emitting a table *is* the test. To check one negatively (prove it catches
+a bad table), build a throwaway file in `/tmp` with the violation and confirm
+the assembler rejects it.
+
+**Runtime tests** follow the normal three-step registration. Patterns used by
+the existing suite:
+
+- **Bit math** — feed known values (`POPCOUNT` of `0xF0F0` = 8; `lzcnt(0)` =
+  64, which `bsr` cannot express). Prefer the zero/edge inputs that
+  distinguish the single-instruction forms from their undefined-at-zero
+  predecessors.
+- **Lexer** — drive `fp$lexer_byte` one byte at a time and assert the exact
+  token sequence: a full pattern (ELF magic → category token), a byte that is
+  no pattern's prefix (raw passthrough), a partial pattern then `fp$lexer_flush`
+  (drains as raw tokens), and a non-pattern byte ahead of a pattern (suffix
+  demotion). Call `fp$lexer_init` first to isolate the state machine.
+- **Comparator** — cover the three sentinels (equal → 0; zero operand or sign
+  mismatch → 999) plus known ratios whose expected rung you compute offline
+  (`gap = ((max−min)<<32)/min`, then the first ladder entry ≥ gap). Boundary
+  cases sit exactly on a rung.
+- **Sparse / attention** — build a sparse row by hand with `SPARSE_ROW_APPEND`,
+  assert the stored count/indices/values, then verify iteration order and the
+  accumulated sums. `WEIGHT_APPLY` and `ATTENTION_PRUNE_POSITION` are tested
+  against small fixed matrices/score rows with hand-computed expectations.
+
+Action macros for `MASK_ITERATE`/`SPARSE_ROW_ITERATE` are expanded once per
+element with the index in `rcx` (and, for rows, the row in a register pair you
+choose); keep them tiny and preserve `rcx`.
 
 ## Regression practices
 
