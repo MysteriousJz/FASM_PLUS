@@ -96,7 +96,7 @@ macro ASSERT_LT reg*, bound*
 }
 macro ASSERT_IN_RANGE reg*, low*, high*
 {
-	local	.ok
+	local	.ok, .fail
 	cmp	reg, low
 	jl	.fail
 	cmp	reg, high

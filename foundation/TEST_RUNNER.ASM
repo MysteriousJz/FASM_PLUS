@@ -20,10 +20,16 @@ entry _start
 ; library layers, bottom-up
 include 'CONSTANTS.INC'
 include 'CONTRACTS.INC'
+include 'BIT_MATH.INC'
 include 'STATE_MANAGEMENT.INC'
 include 'MEMORY_PRIMITIVES.INC'
 include 'CONTROL_FLOW.INC'
 include 'IO_BASIC.INC'
+include 'TOKEN_MANAGEMENT.INC'
+include 'LEXER.INC'
+include 'FIBONACCI.INC'
+include 'SPARSE_STRUCTURES.INC'
+include 'ATTENTION_SCAFFOLDING.INC'
 include 'TEST_FRAMEWORK.INC'
 include 'BOOTSTRAP.INC'
 include 'CRASH_DETECTOR.INC'
@@ -100,6 +106,30 @@ fp$test_registry_begin:
 	REGISTER_TEST tn$print_hex_width,		test$print_hex_width
 	REGISTER_TEST tn$print_int_negative,		test$print_int_negative
 	REGISTER_TEST tn$file_roundtrip,		test$file_roundtrip
+	REGISTER_TEST tn$popcount_basic,		test$popcount_basic
+	REGISTER_TEST tn$count_leading_zeros,		test$count_leading_zeros
+	REGISTER_TEST tn$count_trailing_zeros,		test$count_trailing_zeros
+	REGISTER_TEST tn$bitmath_min_max,		test$bitmath_min_max
+	REGISTER_TEST tn$tokens_in_ranges,		test$tokens_in_ranges
+	REGISTER_TEST tn$tokens_no_collision,		test$tokens_no_collision
+	REGISTER_TEST tn$lexer_init_clears,		test$lexer_init_clears
+	REGISTER_TEST tn$lexer_elf_header,		test$lexer_elf_header
+	REGISTER_TEST tn$lexer_raw_passthrough,		test$lexer_raw_passthrough
+	REGISTER_TEST tn$lexer_partial_flush,		test$lexer_partial_flush
+	REGISTER_TEST tn$lexer_suffix_demotion,		test$lexer_suffix_demotion
+	REGISTER_TEST tn$fib_ladder_monotonic,		test$fib_ladder_monotonic
+	REGISTER_TEST tn$fib_threshold_named,		test$fib_threshold_named
+	REGISTER_TEST tn$closecheck_equal,		test$closecheck_equal
+	REGISTER_TEST tn$closecheck_zero,		test$closecheck_zero
+	REGISTER_TEST tn$closecheck_sign_mismatch,	test$closecheck_sign_mismatch
+	REGISTER_TEST tn$closecheck_known_ratio,	test$closecheck_known_ratio
+	REGISTER_TEST tn$closecheck_out_of_range,	test$closecheck_out_of_range
+	REGISTER_TEST tn$mask_bit_ops,			test$mask_bit_ops
+	REGISTER_TEST tn$mask_iterate_sum,		test$mask_iterate_sum
+	REGISTER_TEST tn$sparse_row_append_iterate,	test$sparse_row_append_iterate
+	REGISTER_TEST tn$premix_2x2,			test$premix_2x2
+	REGISTER_TEST tn$weight_apply,			test$weight_apply
+	REGISTER_TEST tn$attention_prune_mock,		test$attention_prune_mock
 fp$test_registry_end:
 FP_TEST_TOTAL = (fp$test_registry_end - fp$test_registry_begin) / FP_TEST_ENTRY_SIZE
 
