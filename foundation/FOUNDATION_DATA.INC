@@ -58,4 +58,12 @@ fp$str_crash	db 'CRASH sig=',0
 fp$str_rip	db ' rip=0x',0
 fp$str_addr	db ' addr=0x',0
 
+; --- LEXER state (Layer 2.5; see LEXER.INC for layout) ---
+; fp$lexer_state is bit-packed: [3:0] pos = buffered byte count (0..8).
+; fp$lexer_buffer holds up to 8 pattern bytes packed little-endian.
+align 16
+fp$lexer_state	dq 0		; [3:0] pos
+fp$lexer_buffer	dq 0		; packed pattern bytes, LE order
+fp$lexer_last	dq 0		; last token returned (debug/inspection)
+
 end if ; FP_FOUNDATION_DATA_INC
