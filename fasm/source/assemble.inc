@@ -439,6 +439,7 @@ assemble_line:
 ;	 mov	 [operand_prefix],0
 ;	 mov	 [rex_prefix],0
 	and	dword [operand_size],0
+	and	[qword_op_in32],0
 ;	 mov	 [opcode_prefix],0
 ;	 mov	 [vex_required],0
 ;	 mov	 [vex_register],0

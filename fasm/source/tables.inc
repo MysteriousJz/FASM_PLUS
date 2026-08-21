@@ -2719,6 +2719,8 @@ instructions_8:
  dw movshdup_instruction-instruction_handler
  db 'movsldup',12h
  dw movshdup_instruction-instruction_handler
+ db 'movsxd64',63h
+ dw movsxd32_instruction-instruction_handler
  db 'packssdw',6Bh
  dw basic_mmx_instruction-instruction_handler
  db 'packsswb',63h
