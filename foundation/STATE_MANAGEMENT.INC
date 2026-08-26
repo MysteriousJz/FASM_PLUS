@@ -223,6 +223,65 @@ macro RESTORE_FULL_CONTEXT area_reg*
 }
 
 ; -----------------------------------------------------------------------------
+; PUSHAQ / POPAQ
+;   Push/pop all fifteen general-purpose registers (rsp excluded). PUSHAQ is
+;   the 64-bit analogue of the 32-bit PUSHA: every register survives in memory
+;   so a post-mortem (or a context switch) sees the full state.
+;
+;   Push order is r15 first, rax last, so after PUSHAQ:
+;     [rsp+0]  = rdi   [rsp+8]  = rsi   [rsp+16] = rbp   [rsp+24] = rbx
+;     [rsp+32] = rdx   [rsp+40] = rcx   [rsp+48] = r8    [rsp+56] = rax
+;     [rsp+64] = r9    [rsp+72] = r10   [rsp+80] = r11   [rsp+88] = r12
+;     [rsp+96] = r13   [rsp+104]= r14   [rsp+112]= r15
+;   POPAQ is the exact inverse. This pairing is the revertible-effects rule
+;   applied to the register file: every save has a matching restore.
+;
+;   CONTRACT
+;     IN        : nothing
+;     OUT       : 15 qwords pushed (PUSHAQ) / popped (POPAQ)
+;     CLOBBERS  : none (the registers are restored by POPAQ)
+;     ERRORS    : none
+; -----------------------------------------------------------------------------
+macro PUSHAQ
+{
+	push	r15
+	push	r14
+	push	r13
+	push	r12
+	push	r11
+	push	r10
+	push	r9
+	push	r8
+	push	rcx
+	push	rdx
+	push	rbx
+	push	rbp
+	push	rsi
+	push	rdi
+	; rax pushed last so it sits at [rsp+56] with rdi at [rsp+0]
+	push	rax
+}
+
+macro POPAQ
+{
+	pop	rax
+	pop	rdi
+	pop	rsi
+	pop	rbp
+	pop	rbx
+	pop	rdx
+	pop	rcx
+	pop	r8
+	pop	r9
+	pop	r10
+	pop	r11
+	pop	r12
+	pop	r13
+	pop	r14
+	pop	r15
+}
+
+; -----------------------------------------------------------------------------
 ; REDZONE_BARRIER
 ;   A leaf function may legally use the 128-byte red zone below rsp, but a
 ;   function that makes calls must not rely on it (a callee's frame would
