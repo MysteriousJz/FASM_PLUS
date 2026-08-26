@@ -138,17 +138,18 @@ fp$test_summary_and_exit:
 ; =============================================================================
 macro RUN_TEST name_string*, test_function*
 {
+	local fail, done
 	mov	rdi, name_string
 	call	fp$test_report_name
 	call	test_function
 	or	rax, rax
-	jnz	%%fail
+	jnz	fail
 	call	fp$test_pass
-	jmp	%%done
-      %%fail:
+	jmp	done
+      fail:
 	mov	rdi, rax
 	call	fp$test_fail
-      %%done:
+      done:
 }
 
 ; -----------------------------------------------------------------------------

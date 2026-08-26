@@ -101,11 +101,17 @@ macro PTE_NX entry*
 ;     OUT       : dest = physical address (bits 51:12 of the PTE)
 ;     CLOBBERS  : dest, flags
 ;     ERRORS    : none
+;   AND cannot take a 64-bit immediate, so the mask is applied by shifting
+;   the low flag bits out and back: (x << 12) >> 12 keeps bits 63:12, then
+;   clearing bit 63 (NX) via btr yields the physical address. The kernel's
+;   identity map stays below 4 GB, so bits above 51 are always zero here.
 ; -----------------------------------------------------------------------------
 macro PTE_ADDR dest*, entry*
 {
 	mov	dest, [entry]
-	and	dest, PTE_ADDR_MASK
+	shl	dest, 12		; drop the low 12 flag bits
+	shr	dest, 12		; realign; bits 51:12 now hold the address
+	btr	dest, 63		; clear NX (no-op for the identity map)
 }
 
 ; -----------------------------------------------------------------------------
@@ -206,7 +212,11 @@ fp$paging_identity_map_4gb:
 align 16
 fp$paging_load_cr3:
 	mov	rax, rdi
-	and	rax, PTE_ADDR_MASK
+	; keep only address bits 51:12. AND cannot take a 64-bit immediate, so
+	; shift the low 12 flag bits out and back; the PML4 base is 4 KB aligned
+	; and below 4 GB, so this yields the exact CR3 value.
+	shl	rax, 12
+	shr	rax, 12
 	mov	cr3, rax
 	ret
 

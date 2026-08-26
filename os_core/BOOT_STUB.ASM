@@ -36,11 +36,25 @@ if ~ definite FP_PAGING_INC
 end if
 
 ; -----------------------------------------------------------------------------
-; Multiboot2 constants
+; Multiboot constants.
+;
+; The OS core targets Multiboot2 (the modern, extensible spec). However the
+; QEMU system emulator available for CI (8.2) only loads 32-bit ELF images via
+; the original Multiboot (v1) protocol for `-kernel`, and rejects both ELF64
+; class images and PVH ELF notes. To keep `qemu-system-x86_64 -kernel` as the
+; test harness we emit a Multiboot1 header by default and accept BOTH loader
+; magics on entry. Set FP_MB2_HEADER = 1 before including this file to emit a
+; Multiboot2 header instead (for a Multiboot2-capable loader such as GRUB2).
 ; -----------------------------------------------------------------------------
+MB1_MAGIC       = 0x1BADB002    ; Multiboot1 header magic
+MB1_ENTRY_MAGIC = 0x2BADB002    ; EAX on entry from a Multiboot1 loader
 MB2_MAGIC       = 0xE85250D6
 MB2_ARCH_I386   = 0
 MB2_ENTRY_MAGIC = 0x36D76289	; EAX on entry from a Multiboot2 loader
+
+if ~ definite FP_MB2_HEADER
+FP_MB2_HEADER = 0		; default: Multiboot1 (QEMU -kernel compatible)
+end if
 
 ; fixed physical addresses from the locked memory map
 KERNEL_STACK_TOP = 0x70000
@@ -54,29 +68,45 @@ EFER_MSR        = 0xC0000080
 EFER_LME        = 0x00000100    ; long mode enable
 
 ; =============================================================================
-; Multiboot2 header (assembled into the .multiboot_header section)
+; Boot header (assembled first, into the .multiboot_header section)
 ; This is data, not code; it must be findable by the loader in the first 8 KB.
+; FP_MULTIBOOT_HEADER emits a Multiboot1 header (default, QEMU -kernel) or a
+; Multiboot2 header (FP_MB2_HEADER = 1, for GRUB2 and other v2 loaders).
 ; =============================================================================
-macro FP_MULTIBOOT2_HEADER
+macro FP_MULTIBOOT_HEADER
 {
+  if FP_MB2_HEADER
+	; Multiboot2 header: magic, arch, length, checksum, end tag
 align 8
-fp$mb2_header_start:
+fp$mb_header_start:
 	dd MB2_MAGIC
 	dd MB2_ARCH_I386
-	dd fp$mb2_header_end - fp$mb2_header_start
-	dd -(MB2_MAGIC + MB2_ARCH_I386 + (fp$mb2_header_end - fp$mb2_header_start))
+	dd fp$mb_header_end - fp$mb_header_start
+	dd -(MB2_MAGIC + MB2_ARCH_I386 + (fp$mb_header_end - fp$mb_header_start))
 	; end tag (type 0, flags 0, size 8)
 align 8
 	dw 0
 	dw 0
 	dd 8
-fp$mb2_header_end:
+fp$mb_header_end:
+  else
+	; Multiboot1 header: magic, flags(0), checksum. Must be 4-byte aligned.
+	; The ELF program headers already describe the load, so no a.out kludge.
+align 4
+fp$mb_header_start:
+	dd MB1_MAGIC
+	dd 0
+	dd -(MB1_MAGIC + 0)
+fp$mb_header_end:
+  end if
 }
 
 ; =============================================================================
-; _start — 32-bit entry point
+; FP_BOOT_STUB_32 — the 32-bit `_start` entry point, emitted as a macro so
+; OS_TEST.ASM can place it in the low use32 segment.
 ;   CONTRACT
-;     IN        : EAX = Multiboot2 magic (0x36D76289), EBX = MB2 info pointer
+;     IN        : EAX = loader magic (Multiboot1 0x2BADB002 or Multiboot2
+;                 0x36D76289), EBX = loader info pointer
 ;     OUT       : never returns to the loader; ends in fp$kernel_init
 ;     CLOBBERS  : everything
 ;   Verifies the loader magic, builds the identity page tables, enables PAE
@@ -84,13 +114,20 @@ fp$mb2_header_end:
 ;   On any failure it prints a one-letter code to the serial port (which the
 ;   32-bit stub initializes inline) and halts.
 ; =============================================================================
+macro FP_BOOT_STUB_32
+{
 align 16
 _start:
 	; interrupts off for the whole mode switch
 	cli
-	; verify the Multiboot2 magic; on mismatch print 'M' and halt
+	; verify the loader magic; on mismatch print 'M' and halt.
+	; Accept both Multiboot1 (0x2BADB002) and Multiboot2 (0x36D76289) so the
+	; same image boots under QEMU -kernel (v1) and a Multiboot2 loader.
+	cmp	eax, MB1_ENTRY_MAGIC
+	je	.magic_ok
 	cmp	eax, MB2_ENTRY_MAGIC
 	jne	.fail_magic
+      .magic_ok:
 	; initialize COM1 inline (before paging) so failures are visible.
 	; This is the same 16550 sequence as fp$serial_init, written out
 	; because the 64-bit serial functions are not reachable yet.
@@ -210,17 +247,20 @@ _start:
 	cli
 	hlt
 	jmp	.halt
+} ; end FP_BOOT_STUB_32
 
 ; =============================================================================
-; fp$long_mode_entry — 64-bit entry point (executed after the far jump)
+; FP_LONG_MODE_ENTRY — 64-bit entry point, emitted as a macro so OS_TEST.ASM
+; can place it in the 64-bit code segment (the stub above is 32-bit).
 ;   CONTRACT
 ;     IN        : running in 64-bit long mode, identity-mapped, CS=kernel
 ;     OUT       : never returns; ends in fp$kernel_init then the test runner
 ;     CLOBBERS  : everything
 ;   Sets up the 64-bit data segments and the kernel stack, then calls the
-;   kernel initializer. This code is emitted by the REX.W-patched encoder
-;   inside the same use32 section; it only becomes valid after the far jump.
+;   kernel initializer and the test runner. Valid only after the far jump.
 ; =============================================================================
+macro FP_LONG_MODE_ENTRY
+{
 align 16
 fp$long_mode_entry:
 	; 64-bit data segments
@@ -241,5 +281,6 @@ fp$long_mode_entry:
 	cli
 	hlt
 	jmp	.hang
+}
 
 end if ; FP_BOOT_STUB_ASM

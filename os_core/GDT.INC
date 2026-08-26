@@ -127,10 +127,10 @@ fp$gdt_init:
 
 	; load the GDT pointer and reload segments
 	lgdt	[fp$gdtr]
-	mov	rax, GDT_KERNEL_DATA
-	mov	ds, rax
-	mov	es, rax
-	mov	ss, rax
+	mov	ax, GDT_KERNEL_DATA
+	mov	ds, ax
+	mov	es, ax
+	mov	ss, ax
 	; reload CS via a far return through the kernel code selector
 	push	GDT_KERNEL_CODE
 	lea	rax, [.cs_reloaded]
@@ -159,23 +159,26 @@ fp$gdt_load_tss:
 	mov	rdx, 0x67
 	; bytes 2-3: base 15:0
 	mov	rsi, rax
-	and	rsi, 0xFFFF
+	and	esi, 0xFFFF		; 32-bit op zero-extends; base < 4 GB
 	shl	rsi, 16
 	or	rdx, rsi
-	; byte 4: base 23:16
+	; byte 4: base 23:16 (shift base right 16, take the low byte, place at
+	; bits 32-39)
 	mov	rsi, rax
-	and	rsi, 0xFF0000		; isolate base 23:16
-	shl	rsi, 16			; into byte 4 position (bits 32-39)
+	shr	rsi, 16
+	and	esi, 0xFF
+	shl	rsi, 32
 	or	rdx, rsi
 	; byte 5: access = present | available 64-bit TSS (0x89)
 	mov	rsi, GDT_ACC_P or GDT_ACC_TSS64
 	shl	rsi, 40
 	or	rdx, rsi
 	; byte 6: granularity 0 (limit 19:16 = 0, no flags)
-	; byte 7: base 31:24
+	; byte 7: base 31:24 (shift base right 24, take the low byte, bits 56-63)
 	mov	rsi, rax
-	and	rsi, 0xFF000000		; isolate base 31:24
-	shl	rsi, 32			; into byte 7 position (bits 56-63)
+	shr	rsi, 24
+	and	esi, 0xFF
+	shl	rsi, 56
 	or	rdx, rsi
 	mov	[rcx + GDT_TSS], rdx
 	; bytes 8-15: base 63:32 (upper qword of the 16-byte descriptor)

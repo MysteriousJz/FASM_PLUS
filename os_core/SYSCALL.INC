@@ -207,8 +207,11 @@ fp$sys_yield:
 align 16
 fp$sys_mmap:
 	mov	rax, rdi		; requested address
-	cmp	rax, FOUR_GB
-	jae	.fail
+	; identity map covers [0, 4 GB). CMP cannot take a 64-bit immediate, so
+	; test the high dword: any non-zero bit above bit 31 means >= 4 GB.
+	mov	rdx, rax
+	shr	rdx, 32
+	jnz	.fail
 	ret				; identity-mapped: return it
       .fail:
 	mov	rax, E_OUT_OF_MEMORY

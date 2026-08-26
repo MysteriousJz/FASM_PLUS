@@ -56,6 +56,14 @@ struc fp_context {
     .fpu_state rb 512		; FXSAVE area (64-byte aligned by the struct)
 }
 
+; Materialize the field offsets as fp_context.<field> constants. In FASM a
+; struc is a template; the offsets only become usable address constants once
+; the struc is instantiated. Instantiating it in a virtual block at address 0
+; defines every fp_context.<field> as its byte offset without emitting data.
+virtual at 0
+    fp_context fp_context
+end virtual
+
 ; size check: 21 qwords = 168, rounded up to 192, plus 512 = 704
 ; the struct must be a multiple of 64 so .fpu_state is 64-byte aligned
 FP_CONTEXT_SIZE = 704
