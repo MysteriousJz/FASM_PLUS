@@ -165,13 +165,38 @@ also appear on the serial port (COM1, 115200 baud, 8N1).
 
 ## Troubleshooting
 
+### Read the framebuffer diagnostic first
+
+The 32-bit boot stub prints exactly what GRUB2 handed to the kernel, on COM1,
+before the long-mode switch. With a serial connection you will see one of:
+
+```
+FB: LFB=0x00000000fd000000 W=1024 H=768 P=4096 BPP=32
+FB: no framebuffer tag
+```
+
+- **`FB: LFB=0x... W=... H=... P=... BPP=...`** — GRUB2 set a graphics mode and
+  passed a valid framebuffer. If the screen is still black after this, the mode
+  is one the panel cannot display: edit `t440/grub.cfg` and move `1024x768x32`
+  to the front of `gfxmode`, rebuild, and retry.
+- **`FB: no framebuffer tag`** — GRUB2 did not set a graphics mode. The kernel
+  never received a framebuffer. Check that `t440/grub.cfg` loads `insmod vbe`
+  and `insmod all_video`, that `gfxmode` lists a mode the firmware supports,
+  and that the menu entry sets `gfxpayload=keep`.
+- **No `FB:` line at all** — GRUB2 never jumped to the kernel. See the next
+  items.
+
+### The screen stays black but serial shows `FB: LFB=0x...`
+
+The framebuffer handoff worked but the panel cannot show the mode. Reorder
+`t440/grub.cfg`'s `gfxmode` to try `1024x768x32` first (the most universally
+supported VESA mode), rebuild the ISO/USB, and retry.
+
 ### The screen stays black (no `3`, nothing)
 
-- **Check serial first.** The kernel prints `OS_CORE BOOT OK`, then `3`, then
-  the test lines to COM1 regardless of the display. If serial shows output but
-  the screen is black, the framebuffer mode was not what the panel supports.
-  Edit `t440/grub.cfg`: change both `gfxmode` and `gfxpayload` to
-  `1024x768x32` (the safest mode), rebuild the ISO/USB, and retry.
+- **Check serial first.** The kernel prints the `FB:` line, then
+  `OS_CORE BOOT OK`, then `3`, then the test lines to COM1 regardless of the
+  display. The `FB:` line tells you whether GRUB2 set a graphics mode at all.
 - **If serial is also silent**, GRUB2 never handed off to the kernel — see the
   next item.
 

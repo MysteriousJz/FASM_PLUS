@@ -383,6 +383,56 @@ fp$vesa_print:
 	ret
 
 ; =============================================================================
+; fp$vesa_validate — sanity-check the display mode block before drawing
+;   CONTRACT
+;     IN        : nothing (reads fp$display_mode_block)
+;     OUT       : rax = 0 on success, -1 on invalid
+;     CLOBBERS  : rax, flags
+;     PRESERVES : rbx, rbp, rsi, rdi, rcx, rdx, r8-r15
+;     ERRORS    : -1 and zeroes the LFB if the mode block is not usable
+;   Guards the drawing path against a garbage or absent framebuffer handoff:
+;   if GRUB2 (or the BGA) gave us a bad mode block, drawing into it would
+;   fault or corrupt memory. On any failed check the LFB is zeroed so the
+;   rest of the driver treats the framebuffer as absent.
+;
+;   Checks: LFB nonzero, LFB >= 1 MB, LFB < 4 GB, width nonzero, height
+;   nonzero, pitch nonzero. No division — the bound checks are compares.
+; =============================================================================
+align 16
+fp$vesa_validate:
+	mov	rax, qword [fp$display_mode_block + display_mode.lfb]
+	; LFB nonzero
+	test	rax, rax
+	jz	.invalid
+	; LFB >= 1 MB (0x100000): framebuffers never live in the low megabyte
+	cmp	rax, 0x100000
+	jb	.invalid
+	; LFB < 4 GB (0xFFFFFFFF): we support 32-bit physical framebuffers
+	mov	rcx, rax
+	shr	rcx, 32			; high dword of the 64-bit address
+	jnz	.invalid		; nonzero high dword -> above 4 GB
+	; width nonzero
+	mov	rax, qword [fp$display_mode_block + display_mode.width]
+	test	rax, rax
+	jz	.invalid
+	; height nonzero
+	mov	rax, qword [fp$display_mode_block + display_mode.height]
+	test	rax, rax
+	jz	.invalid
+	; pitch nonzero
+	mov	rax, qword [fp$display_mode_block + display_mode.pitch]
+	test	rax, rax
+	jz	.invalid
+	xor	eax, eax		; valid
+	ret
+      .invalid:
+	; zero the LFB so the rest of the driver treats the FB as absent
+	xor	eax, eax
+	mov	qword [fp$display_mode_block + display_mode.lfb], rax
+	mov	rax, -1
+	ret
+
+; =============================================================================
 ; fp$vesa_apply — the Cordis fiber's apply function
 ;   CONTRACT
 ;     IN        : nothing (fiber id is the constant T440_FIBER_VESA)
@@ -405,6 +455,12 @@ fp$vesa_apply:
 	; LFB address is known — from the Multiboot2 framebuffer tag (T440) or
 	; from the Bochs BGA + PCI BAR (QEMU).
 	call	fp$vesa_detect
+	test	rax, rax
+	jnz	.fail
+	; Validate the mode block before touching the framebuffer. A bad handoff
+	; (bad LFB, zero dimensions) is detected here and the LFB is zeroed so
+	; the drawing path treats the framebuffer as absent instead of faulting.
+	call	fp$vesa_validate
 	test	rax, rax
 	jnz	.fail
 	; Map the framebuffer's physical range into the page tables so the CPU

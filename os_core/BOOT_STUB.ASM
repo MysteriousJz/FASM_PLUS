@@ -56,6 +56,12 @@ if ~ definite FP_MB2_HEADER
 FP_MB2_HEADER = 0		; default: Multiboot1 (QEMU -kernel compatible)
 end if
 
+if ~ definite FP_HAS_DISPLAY
+FP_HAS_DISPLAY = 0		; default: no display (bare OS core). The T440
+				; image sets this to 1 and provides the display
+				; mode block + the framebuffer diagnostics data.
+end if
+
 ; Preferred graphics mode for the Multiboot2 framebuffer request tag. The T440
 ; panel is 1600x900, but 1024x768x32 is the safest VESA mode; GRUB2 picks the
 ; closest mode the firmware supports. These are only preferences.
@@ -150,10 +156,161 @@ fp$mb_header_end:
 ;     +8  framebuffer_addr (u64)   +16 pitch (u32)   +20 width (u32)
 ;     +24 height (u32)             +28 bpp (u8)      +29 type (u8)
 ;   We copy addr/pitch/width/height/bpp into fp$display_mode_block. The
-;   framebuffer_addr is below 4 GB on the T440, so a 32-bit copy suffices for
-;   the low dword; we zero the high dword.
+;   framebuffer address is a full 64-bit value (the T440's LFB can be above
+;   4 GB), so both dwords of the address are preserved.
 ;   No division: tag advance uses (size + 7) and (not 7) for 8-byte alignment.
 ; =============================================================================
+; =============================================================================
+; 32-bit serial diagnostics (run before the long-mode switch, so the 64-bit
+; serial functions are not yet reachable). These use COM1 at 0x3F8, which the
+; stub initializes inline in FP_BOOT_STUB_32.
+; =============================================================================
+
+; FP_MB2_PUTCHAR — write one ASCII character (in AL) to COM1.
+;   CLOBBERS: dx. Preserves everything else.
+macro FP_MB2_PUTCHAR
+{
+	mov	dx, 0x3F8
+	out	dx, al
+}
+
+; FP_MB2_PRINT_HEX32 — print EAX as 8 hex digits to COM1.
+;   CLOBBERS: eax, ecx, edx, esi, flags.
+macro FP_MB2_PRINT_HEX32
+{
+	local .digit, .n, .e
+	mov	esi, eax		; save value
+	mov	ecx, 8			; 8 nibbles
+      .digit:
+	rol	esi, 4
+	mov	eax, esi
+	and	eax, 0xF
+	cmp	eax, 10
+	jb	.n
+	add	eax, 'a' - 10
+	jmp	.e
+      .n:
+	add	eax, '0'
+      .e:
+	FP_MB2_PUTCHAR
+	dec	ecx
+	jnz	.digit
+}
+
+; FP_MB2_PRINT_DEC — print EAX as unsigned decimal to COM1.
+;   Repeated-subtraction over a power-of-ten table: NO division. Prints at
+;   least one digit (0 prints as "0").
+;   CLOBBERS: eax, ecx, edx, esi, edi, flags.
+macro FP_MB2_PRINT_DEC
+{
+	local .find, .floop, .emit, .subloop, .skip, .done
+	mov	esi, eax		; value
+	test	esi, esi
+	jnz	.find
+	; value is 0: print a single '0'
+	mov	eax, '0'
+	FP_MB2_PUTCHAR
+	jmp	.done
+      .find:
+	mov	edi, fp$mb2_pow10
+      .floop:
+	mov	eax, [edi]
+	test	eax, eax
+	jz	.done			; table exhausted
+	cmp	esi, eax
+	jae	.emit
+	add	edi, 4
+	jmp	.floop
+      .emit:
+	; count how many times this power fits (repeated subtraction)
+	xor	ecx, ecx		; digit
+      .subloop:
+	cmp	esi, eax
+	jb	.skip
+	sub	esi, eax
+	inc	ecx
+	jmp	.subloop
+      .skip:
+	mov	eax, ecx
+	add	eax, '0'
+	FP_MB2_PUTCHAR
+	add	edi, 4			; next (smaller) power
+	mov	eax, [edi]
+	test	eax, eax
+	jz	.done
+	jmp	.emit
+      .done:
+}
+
+; FP_MB2_PRINT_CSTR — print the NUL-terminated string at ESI to COM1.
+;   CLOBBERS: eax, edx, esi, flags.
+macro FP_MB2_PRINT_CSTR
+{
+	local .loop, .done
+      .loop:
+	movzx	eax, byte [esi]
+	test	al, al
+	jz	.done
+	FP_MB2_PUTCHAR
+	inc	esi
+	jmp	.loop
+      .done:
+}
+
+; FP_MB2_FB_DIAG — report the framebuffer handoff to serial.
+;   If a framebuffer tag was copied (fp$mb2_fb_present = 1), print:
+;     FB: LFB=0x........ W=.. H=.. P=.. BPP=..
+;   Otherwise print "FB: no framebuffer tag".
+;   Runs in 32-bit mode; uses the inline COM1 port. Clobbers eax, ecx, edx,
+;   esi, edi, flags.
+macro FP_MB2_FB_DIAG
+{
+	local .notag, .done
+	cmp	dword [fp$mb2_fb_present], 1
+	jne	.notag
+	; "FB: LFB=0x"
+	mov	esi, fp$mb2_str_lfb
+	FP_MB2_PRINT_CSTR
+	mov	eax, dword [fp$display_mode_block + display_mode.lfb + 4]
+	FP_MB2_PRINT_HEX32		; high dword
+	mov	eax, dword [fp$display_mode_block + display_mode.lfb]
+	FP_MB2_PRINT_HEX32		; low dword
+	; " W="
+	mov	esi, fp$mb2_str_w
+	FP_MB2_PRINT_CSTR
+	mov	eax, dword [fp$display_mode_block + display_mode.width]
+	FP_MB2_PRINT_DEC
+	; " H="
+	mov	esi, fp$mb2_str_h
+	FP_MB2_PRINT_CSTR
+	mov	eax, dword [fp$display_mode_block + display_mode.height]
+	FP_MB2_PRINT_DEC
+	; " P="
+	mov	esi, fp$mb2_str_p
+	FP_MB2_PRINT_CSTR
+	mov	eax, dword [fp$display_mode_block + display_mode.pitch]
+	FP_MB2_PRINT_DEC
+	; " BPP="
+	mov	esi, fp$mb2_str_bpp
+	FP_MB2_PRINT_CSTR
+	mov	eax, dword [fp$display_mode_block + display_mode.bpp]
+	FP_MB2_PRINT_DEC
+	; newline
+	mov	al, 13
+	FP_MB2_PUTCHAR
+	mov	al, 10
+	FP_MB2_PUTCHAR
+	jmp	.done
+      .notag:
+	mov	esi, fp$mb2_str_nofb
+	FP_MB2_PRINT_CSTR
+	mov	al, 13
+	FP_MB2_PUTCHAR
+	mov	al, 10
+	FP_MB2_PUTCHAR
+      .done:
+}
+
 macro FP_MB2_COPY_FB
 {
 	local .scan, .next, .done, .found
@@ -179,11 +336,14 @@ macro FP_MB2_COPY_FB
 	jmp	.scan
       .found:
 	; copy the framebuffer fields into the display mode block. The block is
-	; a sequence of qwords; write the low dword of each and zero the high
-	; dword (the framebuffer address is below 4 GB on the T440).
+	; a sequence of qwords. The framebuffer address is a FULL 64-bit value
+	; (the T440's LFB can be above 4 GB), so copy BOTH dwords of the address.
+	; The other fields are 32-bit (or smaller) in the tag; zero their high
+	; dwords.
 	mov	eax, [esi + 8]		; framebuffer_addr low dword
 	mov	dword [fp$display_mode_block + display_mode.lfb], eax
-	mov	dword [fp$display_mode_block + display_mode.lfb + 4], 0
+	mov	eax, [esi + 12]		; framebuffer_addr HIGH dword (preserve it)
+	mov	dword [fp$display_mode_block + display_mode.lfb + 4], eax
 	mov	eax, [esi + 20]		; width
 	mov	dword [fp$display_mode_block + display_mode.width], eax
 	mov	dword [fp$display_mode_block + display_mode.width + 4], 0
@@ -196,7 +356,40 @@ macro FP_MB2_COPY_FB
 	movzx	eax, byte [esi + 28]	; bpp
 	mov	dword [fp$display_mode_block + display_mode.bpp], eax
 	mov	dword [fp$display_mode_block + display_mode.bpp + 4], 0
+	; record that a framebuffer tag was found (for the serial diagnostic)
+	mov	dword [fp$mb2_fb_present], 1
       .done:
+}
+
+; =============================================================================
+; FP_MB2_DATA — the data the 32-bit stub diagnostics use. Emitted into the
+; current data area by the top-level image (OS_TEST_T440.ASM). All of it is
+; read/written by 32-bit code before the long-mode switch, so it must be in a
+; segment the stub can address (the .data region).
+; =============================================================================
+macro FP_MB2_DATA
+{
+align 4
+fp$mb2_fb_present	dd 0			; 1 = a framebuffer tag was copied
+fp$mb2_str_lfb		db 'FB: LFB=0x', 0
+fp$mb2_str_w		db ' W=', 0
+fp$mb2_str_h		db ' H=', 0
+fp$mb2_str_p		db ' P=', 0
+fp$mb2_str_bpp		db ' BPP=', 0
+fp$mb2_str_nofb		db 'FB: no framebuffer tag', 0
+align 4
+fp$mb2_pow10:
+	dd 1000000000
+	dd 100000000
+	dd 10000000
+	dd 1000000
+	dd 100000
+	dd 10000
+	dd 1000
+	dd 100
+	dd 10
+	dd 1
+	dd 0				; sentinel
 }
 
 macro FP_BOOT_STUB_32
@@ -214,10 +407,11 @@ _start:
 	jne	.fail_magic
 	; Multiboot2: EBX points at the boot-information structure. Copy the
 	; framebuffer tag (if present) into the display mode block now, before
-	; serial init clobbers EAX and before the long-mode switch. The copy only
-	; happens when the image defines a display mode block (the T440 layer
-	; does; the bare OS core does not), keeping the core build standalone.
-	if definite fp$display_mode_block
+	; serial init clobbers EAX and before the long-mode switch. The copy and
+	; the diagnostic run only when the image carries a display (the top-level
+	; image sets FP_HAS_DISPLAY = 1 and provides fp$display_mode_block; the
+	; bare OS core leaves it 0 and stays standalone).
+	if FP_HAS_DISPLAY
 	FP_MB2_COPY_FB
 	end if
 	jmp	.magic_ok
@@ -243,6 +437,13 @@ _start:
 	mov	dx, 0x3FA		; FCR
 	mov	al, 0xC7
 	out	dx, al			; FIFO on
+
+	; Serial is up. Report the framebuffer handoff so the physical T440 boot
+	; shows exactly what the loader passed us. Only when the image carries a
+	; display (the top-level image sets FP_HAS_DISPLAY = 1).
+	if FP_HAS_DISPLAY
+	FP_MB2_FB_DIAG
+	end if
 
 	; ---------------------------------------------------------------------
 	; Build the identity page tables at 0x90000 (PML4), 0x91000-0x94000

@@ -35,6 +35,11 @@ if ~ definite FP_MB2_HEADER
 FP_MB2_HEADER = 0
 end if
 
+; The T440 image has a display. This tells the boot stub to copy the Multiboot2
+; framebuffer tag into fp$display_mode_block and to print the framebuffer
+; diagnostic to serial. The bare OS core leaves FP_HAS_DISPLAY = 0.
+FP_HAS_DISPLAY = 1
+
 ; =============================================================================
 ; Region 0 (first): the Multiboot header, at the very start of the file.
 ; -----------------------------------------------------------------------------
@@ -175,6 +180,27 @@ use64
 	dw fp$boot_gdt_end - fp$boot_gdt - 1
 	dd fp$boot_gdt
 
+    ; ---------------------------------------------------------------------
+    ; Display mode block — lives in INITIALIZED DATA, not BSS.
+    ;
+    ; The 32-bit boot stub writes the Multiboot2 framebuffer tag here before
+    ; the long-mode switch. If this block were in BSS, a loader that zeroes
+    ; BSS at load time could wipe the values the stub just wrote (or the
+    ; timing could race). Keeping it in .data (explicitly initialized to zero)
+    ; means the loader writes real bytes to the file image and nothing
+    ; re-zeroes it afterward. The stub then overwrites the fields when a
+    ; framebuffer tag is present.
+    ; ---------------------------------------------------------------------
+    align 64
+    fp$display_mode_block:
+	dq 0				; lfb    (full 64-bit physical address)
+	dq 0				; width
+	dq 0				; height
+	dq 0				; pitch
+	dq 0				; bpp
+    ; Multiboot2 framebuffer-handoff diagnostic strings + state (32-bit stub)
+    FP_MB2_DATA
+
 ; =============================================================================
 ; Region 4: zero-initialized BSS (use64)
 ; =============================================================================
@@ -208,9 +234,7 @@ use64
     fp$pci_device_table	rb PCI_MAX_DEVICES * PCI_DEV_SIZE
     align 8
     fp$pci_device_count rq 1
-    ; display mode block (lfb, width, height, pitch, bpp)
-    align 64
-    fp$display_mode_block rb DISPLAY_MODE_SIZE
+    ; (the display mode block moved to Region 3 / .data — see above)
     ; putchar scratch slots (glyph base + fg color survive fp$vesa_putpixel,
     ; which clobbers rcx/r8)
     align 8
