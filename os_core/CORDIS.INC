@@ -184,6 +184,7 @@ fp$cordis_fiber_ptr:
 	ret
 
 ; fp$coeffect_find — rdi = key -> rax = coeffect index or CORDIS_NIL
+; Finds a used coeffect slot for the key regardless of provider state.
 ;   CONTRACT: IN rdi=key; OUT rax=index|-1; CLOBBERS rax, rcx, rdx, flags.
 align 16
 fp$coeffect_find:
@@ -205,6 +206,50 @@ fp$coeffect_find:
 	ret
       .found:
 	mov	rax, rdx
+	ret
+
+; fp$coeffect_find_active — rdi = key -> rax = coeffect index or CORDIS_NIL
+; Like fp$coeffect_find, but only matches a provision whose provider fiber is
+; currently ACTIVE. This is the reactive-coeffect rule (paper Section 5.1.2):
+; a binding is available to a dependent only while its provider is Active, so
+; a provider that has entered Unloading stops satisfying dependents before its
+; bindings are physically removed — that interval is the dependent's teardown
+; window.
+;   CONTRACT: IN rdi=key; OUT rax=index|-1; CLOBBERS rax, rcx, rdx, rsi, r8.
+align 16
+fp$coeffect_find_active:
+	push	rbx
+	mov	rcx, fp$cordis_coeffects
+	xor	edx, edx
+      .scan:
+	mov	rax, [rcx + cordis_coeffect.used]
+	test	rax, rax
+	jz	.next
+	mov	rax, [rcx + cordis_coeffect.key]
+	cmp	rax, rdi
+	jne	.next
+	; key matches; check the provider is ACTIVE
+	push	rcx
+	push	rdx
+	mov	rbx, rdi			; save key
+	mov	rdi, [rcx + cordis_coeffect.provider]
+	call	fp$cordis_fiber_ptr
+	mov	rsi, [rax + cordis_fiber.state]
+	mov	rdi, rbx			; restore key
+	pop	rdx
+	pop	rcx
+	cmp	rsi, FIBER_ACTIVE
+	jne	.next				; provider not active -> not satisfied
+	mov	rax, rdx
+	pop	rbx
+	ret
+      .next:
+	add	rcx, CORDIS_COEFFECT_SIZE
+	inc	edx
+	cmp	edx, CORDIS_MAX_COEFFECTS
+	jb	.scan
+	mov	rax, CORDIS_NIL
+	pop	rbx
 	ret
 
 ; fp$coeffect_find_free -> rax = free coeffect index or CORDIS_NIL
@@ -479,7 +524,7 @@ fp$coeffect_resolve:
 	jae	.all_ok
 	lea	rdx, [rbx + cordis_fiber.inject]
 	mov	rdi, [rdx + r13*8]		; key
-	call	fp$coeffect_find
+	call	fp$coeffect_find_active	; satisfied only by an ACTIVE provider
 	cmp	rax, CORDIS_NIL
 	je	.missing
 	inc	r13
@@ -501,10 +546,11 @@ fp$coeffect_resolve:
 	ret
 
 ; fp$coeffect_lookup — rdi = key -> rax = provider value, or CORDIS_NIL if
-; unprovided. Used by tests to confirm a fiber sees a specific value.
+; unprovided. Used by tests to confirm a fiber sees a specific value. Only an
+; ACTIVE provider's value is visible (reactive-coeffect rule).
 align 16
 fp$coeffect_lookup:
-	call	fp$coeffect_find
+	call	fp$coeffect_find_active
 	cmp	rax, CORDIS_NIL
 	je	.none
 	mov	rcx, CORDIS_COEFFECT_SIZE
@@ -667,30 +713,36 @@ fp$fiber_unload:
 	push	rbx
 	push	r12
 	mov	r12, rdi			; r12 = target fiber
-	; ----- Leave phase: withdraw provisions -----
-	call	fp$coeffect_withdraw
+	; ----- L-Leave -----
+	; Mark Unloading. Under the active-provider rule (fp$coeffect_find_active)
+	; the target stops satisfying its dependents the instant its state leaves
+	; Active, yet its bindings are still physically in the table — that
+	; interval is the dependents' teardown window (paper Section 5.1.2).
 	call	fp$cordis_fiber_ptr
 	mov	rbx, rax			; rbx = &target fiber
 	mov	rax, FIBER_UNLOADING
 	mov	[rbx + cordis_fiber.state], rax
-	; clear its provide list
-	mov	qword [rbx + cordis_fiber.provide_count], 0
-	; ----- Cascade: deactivate any Active fiber whose deps no longer
-	;       resolve (because this fiber's provisions are gone). -----
+	; Cascade: any fiber whose inject list no longer resolves against an
+	; ACTIVE provider deactivates (reverts its own effects, marks Inactive).
 	call	fp$cordis_deactivate_unsatisfied
-	; ----- Unload phase: only when nothing relies on the target -----
+	; ----- L-Unload -----
+	; Guard: hold the withdrawal until nothing relies on the target.
 	mov	rdi, r12
 	call	fp$fiber_relied
 	test	rax, rax
 	jnz	.busy
-	; revert the target's effects
+	; Revert the target's own effects (apply its accumulator, LIFO).
 	mov	rdi, r12
 	call	fp$fiber_revert_effects
-	; mark Inactive and clear its lists
+	; Discard the committed view: physically withdraw the provisions now
+	; that every dependent has gone, and clear the provide list.
+	mov	rdi, r12
+	call	fp$coeffect_withdraw
 	mov	rdi, r12
 	call	fp$cordis_fiber_ptr
 	mov	rdx, FIBER_INACTIVE
 	mov	[rax + cordis_fiber.state], rdx
+	mov	qword [rax + cordis_fiber.provide_count], 0
 	mov	qword [rax + cordis_fiber.inject_count], 0
 	xor	eax, eax
 	pop	r12
