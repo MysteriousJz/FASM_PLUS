@@ -56,6 +56,13 @@ if ~ definite FP_MB2_HEADER
 FP_MB2_HEADER = 0		; default: Multiboot1 (QEMU -kernel compatible)
 end if
 
+; Preferred graphics mode for the Multiboot2 framebuffer request tag. The T440
+; panel is 1600x900, but 1024x768x32 is the safest VESA mode; GRUB2 picks the
+; closest mode the firmware supports. These are only preferences.
+MB2_REQ_WIDTH  = 1024
+MB2_REQ_HEIGHT = 768
+MB2_REQ_DEPTH  = 32
+
 ; fixed physical addresses from the locked memory map
 KERNEL_STACK_TOP = 0x70000
 PML4_BASE        = 0x90000
@@ -76,13 +83,25 @@ EFER_LME        = 0x00000100    ; long mode enable
 macro FP_MULTIBOOT_HEADER
 {
   if FP_MB2_HEADER
-	; Multiboot2 header: magic, arch, length, checksum, end tag
+	; Multiboot2 header: magic, arch, length, checksum, then tags.
+	; The framebuffer request tag (type 5) asks the loader to set a graphics
+	; mode and pass the LFB back in the boot-information structure.
 align 8
 fp$mb_header_start:
 	dd MB2_MAGIC
 	dd MB2_ARCH_I386
 	dd fp$mb_header_end - fp$mb_header_start
 	dd -(MB2_MAGIC + MB2_ARCH_I386 + (fp$mb_header_end - fp$mb_header_start))
+	; framebuffer request tag (type 5, flags 0, size 20): ask for a linear
+	; graphics mode. width/height/depth are a *preference*; the loader picks
+	; the closest mode it supports (0 = no preference).
+align 8
+	dw 5			; type = framebuffer request
+	dw 0			; flags
+	dd 20			; size
+	dd MB2_REQ_WIDTH	; preferred width
+	dd MB2_REQ_HEIGHT	; preferred height
+	dd MB2_REQ_DEPTH	; preferred depth (bpp)
 	; end tag (type 0, flags 0, size 8)
 align 8
 	dw 0
@@ -114,6 +133,72 @@ fp$mb_header_end:
 ;   On any failure it prints a one-letter code to the serial port (which the
 ;   32-bit stub initializes inline) and halts.
 ; =============================================================================
+; =============================================================================
+; FP_MB2_COPY_FB — parse the Multiboot2 boot-information structure and copy the
+; framebuffer tag into the kernel's display mode block.
+;   CONTRACT
+;     IN        : EBX = physical address of the Multiboot2 info structure
+;                 (valid only when the loader magic was 0x36D76289)
+;     OUT       : fp$display_mode_block filled if a framebuffer tag is present
+;     CLOBBERS  : eax, ecx, edx, esi, edi, flags
+;   Runs in 32-bit protected mode before the long-mode switch, so the
+;   framebuffer address is captured early and is available to 64-bit code.
+;   The info structure is a sequence of 8-byte-aligned tags:
+;     [0]  total size (u32)   [4] reserved (u32)
+;     then tags: each = { u32 type, u32 size, payload... } padded to 8 bytes.
+;   The framebuffer tag (type 8) payload:
+;     +8  framebuffer_addr (u64)   +16 pitch (u32)   +20 width (u32)
+;     +24 height (u32)             +28 bpp (u8)      +29 type (u8)
+;   We copy addr/pitch/width/height/bpp into fp$display_mode_block. The
+;   framebuffer_addr is below 4 GB on the T440, so a 32-bit copy suffices for
+;   the low dword; we zero the high dword.
+;   No division: tag advance uses (size + 7) and (not 7) for 8-byte alignment.
+; =============================================================================
+macro FP_MB2_COPY_FB
+{
+	local .scan, .next, .done, .found
+	mov	esi, ebx		; esi = info structure base
+	mov	ecx, [esi]		; ecx = total size
+	test	ecx, ecx
+	jz	.done
+	add	ecx, esi		; ecx = end of structure
+	add	esi, 8			; first tag
+      .scan:
+	cmp	esi, ecx
+	jae	.done			; ran off the end
+	mov	eax, [esi]		; tag type
+	test	eax, eax
+	jz	.done			; end tag (type 0)
+	cmp	eax, 8			; framebuffer tag?
+	je	.found
+      .next:
+	mov	edx, [esi + 4]		; tag size
+	add	edx, 7
+	and	edx, -8			; round up to 8 bytes
+	add	esi, edx
+	jmp	.scan
+      .found:
+	; copy the framebuffer fields into the display mode block. The block is
+	; a sequence of qwords; write the low dword of each and zero the high
+	; dword (the framebuffer address is below 4 GB on the T440).
+	mov	eax, [esi + 8]		; framebuffer_addr low dword
+	mov	dword [fp$display_mode_block + display_mode.lfb], eax
+	mov	dword [fp$display_mode_block + display_mode.lfb + 4], 0
+	mov	eax, [esi + 20]		; width
+	mov	dword [fp$display_mode_block + display_mode.width], eax
+	mov	dword [fp$display_mode_block + display_mode.width + 4], 0
+	mov	eax, [esi + 24]		; height
+	mov	dword [fp$display_mode_block + display_mode.height], eax
+	mov	dword [fp$display_mode_block + display_mode.height + 4], 0
+	mov	eax, [esi + 16]		; pitch (bytes per scanline)
+	mov	dword [fp$display_mode_block + display_mode.pitch], eax
+	mov	dword [fp$display_mode_block + display_mode.pitch + 4], 0
+	movzx	eax, byte [esi + 28]	; bpp
+	mov	dword [fp$display_mode_block + display_mode.bpp], eax
+	mov	dword [fp$display_mode_block + display_mode.bpp + 4], 0
+      .done:
+}
+
 macro FP_BOOT_STUB_32
 {
 align 16
@@ -127,6 +212,11 @@ _start:
 	je	.magic_ok
 	cmp	eax, MB2_ENTRY_MAGIC
 	jne	.fail_magic
+	; Multiboot2: EBX points at the boot-information structure. Copy the
+	; framebuffer tag (if present) into the display mode block now, before
+	; serial init clobbers EAX and before the long-mode switch.
+	FP_MB2_COPY_FB
+	jmp	.magic_ok
       .magic_ok:
 	; initialize COM1 inline (before paging) so failures are visible.
 	; This is the same 16550 sequence as fp$serial_init, written out

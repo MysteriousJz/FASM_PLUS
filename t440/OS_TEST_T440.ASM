@@ -28,6 +28,13 @@
 format elf executable at 0x100000
 entry _start
 
+; Select the boot protocol. 0 = Multiboot1 (QEMU -kernel, default for CI);
+; 1 = Multiboot2 (GRUB2 on the physical T440). The build script passes the
+; value; if it is not passed, default to Multiboot1 so the QEMU path works.
+if ~ definite FP_MB2_HEADER
+FP_MB2_HEADER = 0
+end if
+
 ; =============================================================================
 ; Region 0 (first): the Multiboot header, at the very start of the file.
 ; -----------------------------------------------------------------------------
@@ -39,12 +46,38 @@ entry _start
 ; =============================================================================
 segment readable executable
 use32
+  if FP_MB2_HEADER
+	; Multiboot2 header: magic, arch, length, checksum, framebuffer request
+	; tag (type 5), end tag. 8-byte aligned; must be in the first 8 KB.
+align 8
+fp$mb_header_start:
+	dd 0xE85250D6			; Multiboot2 magic
+	dd 0				; architecture: i386
+	dd fp$mb_header_end - fp$mb_header_start
+	dd -(0xE85250D6 + 0 + (fp$mb_header_end - fp$mb_header_start))
+	; framebuffer request tag (type 5, flags 0, size 20)
+align 8
+	dw 5
+	dw 0
+	dd 20
+	dd 1024				; preferred width
+	dd 768				; preferred height
+	dd 32				; preferred depth (bpp)
+	; end tag
+align 8
+	dw 0
+	dw 0
+	dd 8
+fp$mb_header_end:
+  else
+	; Multiboot1 header (QEMU -kernel). 4-byte aligned, in the first 8 KB.
 align 4
 fp$mb_header_start:
 	dd 0x1BADB002			; Multiboot1 magic
 	dd 0				; flags (ELF program headers describe the load)
 	dd -(0x1BADB002 + 0)		; checksum
 fp$mb_header_end:
+  end if
 
 ; =============================================================================
 ; Region 2: 64-bit OS core + T440 driver code (use64)
