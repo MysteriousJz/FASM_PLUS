@@ -37,7 +37,11 @@ TEST paging... PASS
 TEST exception... PASS
 TEST context... PASS
 TEST syscall... PASS
-SUMMARY 8/8
+TEST fiber_tree_dependency_chain... PASS
+TEST fiber_tree_root_unload... PASS
+TEST fiber_tree_root_reload... PASS
+TEST fiber_tree_hot_replace... PASS
+SUMMARY 12/12
 ```
 
 ---
@@ -57,6 +61,7 @@ SUMMARY 8/8
 | `EXCEPTIONS.INC`    | Exception handlers (vectors 0–31) with full reporting       |
 | `CONTEXT.INC`       | Task context save / restore / switch                        |
 | `SYSCALL.INC`       | SYSCALL/SYSRET interface and dispatch table                 |
+| `CORDIS.INC`        | Cordis layer: Context Registry, effects, coeffects, fibers  |
 | `KERNEL_INIT.INC`   | Bootstrap sequence + boot banner                            |
 | `KERNEL_TEST.INC`   | Test-runner primitives (report, pass/fail, summary, exit)   |
 | `build.sh`          | Assemble and boot/test helper                               |
@@ -125,6 +130,78 @@ port `0xF4`. QEMU transforms the written value `V` into exit status
 | `0x01`        | `3`              | a test failed  |
 
 `build.sh test` decodes this back to the conventional `0` = pass, `1` = fail.
+
+---
+
+## The Cordis layer — dynamic composability
+
+The kernel is not just a platform for user programs; it is the **substrate for
+dynamic composability**. Every component — a *fiber* — can be loaded when its
+dependencies are satisfied, unloaded when they disappear, and reverted when
+unloaded. `CORDIS.INC` implements this with three ideas:
+
+1. **Revertible effects** — every state-changing operation is paired with an
+   inverse function. When a fiber unloads, its inverses run in LIFO order,
+   returning the system to its pre-fiber state.
+2. **Declared dependencies** — a fiber declares what it needs (*inject*) and
+   what it contributes (*provide*). The kernel tracks current provisions; when
+   a provider disappears, dependents are deactivated automatically.
+3. **The Context is first-class** — all state (fibers, provisions, effects)
+   lives in one fixed-size **Context Registry** in BSS. No dynamic allocation.
+
+### Context Registry layout
+
+Fixed-size, 64-byte aligned, zero-initialized at boot by `fp$cordis_init`:
+
+```
+fp$cordis_fibers[64]      fiber entries: state, id, inject[] / provide[]
+                          lists, provide_val[], and a LIFO effect stack head
+fp$cordis_coeffects[128]  current provisions: key -> { provider, value }
+fp$cordis_effects[256]    revertible operations: fiber, inverse fn, context
+```
+
+Keys are 64-bit integer tokens supplied by the caller, so resolution is a
+single `cmp` and never divides.
+
+### Cordis syscalls
+
+Added to the dispatch table (numbers 0–7 unchanged):
+
+| #  | Name              | Arguments                          | Returns            |
+|----|-------------------|------------------------------------|--------------------|
+| 8  | `effect_begin`    | RDI = fiber                        | RAX = 0            |
+| 9  | `effect_commit`   | —                                  | RAX = 0            |
+| 10 | `effect_rollback` | —                                  | RAX = 0            |
+| 11 | `coeffect_declare`| RDI = fiber, RSI = key             | RAX = 0 / errno    |
+| 12 | `coeffect_provide`| RDI = fiber, RSI = key, RDX = value| RAX = 0 / errno    |
+| 13 | `coeffect_resolve`| RDI = fiber                        | RAX = 0 / E_NOT_FOUND |
+| 14 | `fiber_load`      | RDI = fiber                        | RAX = 0 / E_NOT_FOUND |
+| 15 | `fiber_unload`    | RDI = fiber                        | RAX = 0 / E_BUSY   |
+
+### Fiber lifecycle
+
+```
+Inactive → Loading → Active → Unloading → Inactive
+               ↓
+             Failed
+```
+
+- `fiber_load` marks the fiber Loading, resolves its inject list against the
+  coeffect table, and marks it Active only when every dependency is satisfied.
+- `fiber_unload` is **two-phase**: *Leave* withdraws the fiber's provisions
+  (which cascades — `fp$cordis_deactivate_unsatisfied` deactivates any fiber
+  whose dependencies no longer resolve), then *Unload* reverts the fiber's
+  effects and marks it Inactive.
+- **Deactivation guard** (`fp$fiber_relied`): a fiber is not fully unloaded
+  while any Active/Loading fiber relies on a key it provides. The syscall
+  returns `E_BUSY` in that case.
+
+### The fiber-tree test
+
+`TEST fiber_tree_*` builds the tree `A (provides X) → B (injects X, provides
+Y) → C (injects X, Y)` and proves: the dependency chain activates, unloading
+the root provider cascades and reverts effects, reloading restores the tree,
+and hot-replacing A with A′ rebinds dependents to the new value.
 
 ---
 
