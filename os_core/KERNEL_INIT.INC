@@ -20,14 +20,15 @@
 ;   5. PIC         remap 8259 IRQs to 32-47, then mask all (we are polling)
 ;   6. PIT         8254 channel 0 at 100 Hz for the system tick
 ;   7. syscalls    SYSCALL/SYSRET MSRs for ring 3 service calls
-;   8. banner      "OS_CORE BOOT OK"
+;   8. cordis      Context Registry for dynamic composability
+;   9. banner      "OS_CORE BOOT OK"
 ; =============================================================================
 
 if ~ definite FP_KERNEL_INIT_INC
 FP_KERNEL_INIT_INC = 1
 
-if ~ definite FP_SYSCALL_INC
-  err 'KERNEL_INIT.INC requires SYSCALL.INC (and all lower components) first'
+if ~ definite FP_CORDIS_INC
+  err 'KERNEL_INIT.INC requires CORDIS.INC (and all lower components) first'
 end if
 
 ; 8259 PIC ports
@@ -140,7 +141,8 @@ fp$kernel_init:
 	call	fp$pic_remap		; 5. PIC -> vectors 32-47, masked
 	call	fp$pit_init		; 6. PIT at 100 Hz
 	call	fp$syscall_init		; 7. SYSCALL/SYSRET MSRs
-	; 8. banner
+	call	fp$cordis_init		; 8. Cordis Context Registry
+	; 9. banner
 	mov	rdi, fp$kernel_boot_ok
 	call	fp$serial_write
 	ret

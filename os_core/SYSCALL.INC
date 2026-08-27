@@ -22,6 +22,16 @@
 ;   6  munmap   RDI = addr, RSI = len                 RAX = 0
 ;   7  getpid                                         RAX = 1
 ;
+; Cordis dynamic-composability syscalls (handlers live in CORDIS.INC):
+;   8  effect_begin      RDI = fiber id               RAX = 0
+;   9  effect_commit                                 RAX = 0
+;  10  effect_rollback                               RAX = 0
+;  11  coeffect_declare  RDI = fiber, RSI = key      RAX = 0 / errno
+;  12  coeffect_provide  RDI = fiber, RSI = key, RDX = value  RAX = 0 / errno
+;  13  coeffect_resolve  RDI = fiber                 RAX = 0 / E_NOT_FOUND
+;  14  fiber_load        RDI = fiber                 RAX = 0 / E_NOT_FOUND
+;  15  fiber_unload      RDI = fiber                 RAX = 0 / E_BUSY
+;
 ; MSR setup (fp$syscall_init):
 ;   EFER   (0xC0000080)  bit 0 SCE = 1   enable SYSCALL/SYSRET
 ;   STAR   (0xC0000081)  segment selectors for both directions
@@ -64,7 +74,16 @@ FP_SYS_yield    = 4
 FP_SYS_mmap     = 5
 FP_SYS_munmap   = 6
 FP_SYS_getpid   = 7
-FP_SYS_MAX      = 7
+; Cordis primitives (handlers in CORDIS.INC)
+FP_SYS_effect_begin      = 8
+FP_SYS_effect_commit     = 9
+FP_SYS_effect_rollback   = 10
+FP_SYS_coeffect_declare  = 11
+FP_SYS_coeffect_provide  = 12
+FP_SYS_coeffect_resolve  = 13
+FP_SYS_fiber_load        = 14
+FP_SYS_fiber_unload      = 15
+FP_SYS_MAX      = 15
 
 ; =============================================================================
 ; fp$syscall_init
@@ -242,5 +261,15 @@ fp$syscall_table:
 	dq fp$sys_mmap
 	dq fp$sys_munmap
 	dq fp$sys_getpid
+	; Cordis primitives (handlers defined in CORDIS.INC, resolved by FASM's
+	; multi-pass forward referencing)
+	dq fp$effect_begin
+	dq fp$effect_commit
+	dq fp$effect_rollback
+	dq fp$coeffect_declare
+	dq fp$coeffect_provide
+	dq fp$coeffect_resolve
+	dq fp$fiber_load
+	dq fp$fiber_unload
 
 end if ; FP_SYSCALL_INC

@@ -21,6 +21,8 @@
 ;   EXCEPTIONS.INC                   exception handlers
 ;   CONTEXT.INC                      task context save/restore/switch
 ;   SYSCALL.INC                      SYSCALL/SYSRET interface
+;   CORDIS.INC                       dynamic composability (fibers, coeffects,
+;                                    effects) — depends on SYSCALL + CONTEXT
 ;   KERNEL_INIT.INC                  bootstrap sequence
 ;   KERNEL_TEST.INC                  test runner
 ;   BOOT_STUB.ASM                    Multiboot2 header + 32->64 switch (code)
@@ -59,6 +61,7 @@ include 'PAGING.INC'
 include 'EXCEPTIONS.INC'
 include 'CONTEXT.INC'
 include 'SYSCALL.INC'
+include 'CORDIS.INC'
 include 'KERNEL_INIT.INC'
 include 'KERNEL_TEST.INC'
 include 'BOOT_STUB.ASM'
@@ -103,6 +106,9 @@ if ~ definite FP_CONTEXT_INC
 end if
 if ~ definite FP_SYSCALL_INC
   err 'OS_CORE.INC: SYSCALL.INC missing'
+end if
+if ~ definite FP_CORDIS_INC
+  err 'OS_CORE.INC: CORDIS.INC missing'
 end if
 if ~ definite FP_KERNEL_INIT_INC
   err 'OS_CORE.INC: KERNEL_INIT.INC missing'

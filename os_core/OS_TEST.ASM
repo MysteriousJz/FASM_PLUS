@@ -141,3 +141,15 @@ use64
     ; ----- Task State Segment (104 bytes) for ring transitions -----
     align 16
     fp$tss		rb 104
+
+    ; ----- Cordis Context Registry: fixed-size, 64-byte aligned, in BSS.
+    ;       Fibers (loaded components), coeffects (current provisions), and
+    ;       effects (revertible operations). No dynamic allocation. -----
+    align 64
+    fp$cordis_fibers	rb CORDIS_MAX_FIBERS * CORDIS_FIBER_SIZE
+    align 64
+    fp$cordis_coeffects	rb CORDIS_MAX_COEFFECTS * CORDIS_COEFFECT_SIZE
+    align 64
+    fp$cordis_effects	rb CORDIS_MAX_EFFECTS * CORDIS_EFFECT_SIZE
+    align 8
+    fp$cordis_scope_fiber rq 1		; fiber id of the open effect scope, or CORDIS_NIL

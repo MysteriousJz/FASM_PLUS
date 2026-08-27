@@ -59,6 +59,15 @@ fp$run_all_tests:
 	RUN_TEST fp$name_context,   fp$test_context
 	RUN_TEST fp$name_syscall,   fp$test_syscall
 
+	; ---------------------------------------------------------------------
+	; The Cordis fiber-tree tests: dependency chain, root unload, reload,
+	; and hot-replace. These prove dynamic composability end to end.
+	; ---------------------------------------------------------------------
+	RUN_TEST fp$name_ft_chain,  fp$test_fiber_tree_chain
+	RUN_TEST fp$name_ft_unload, fp$test_fiber_tree_unload
+	RUN_TEST fp$name_ft_reload, fp$test_fiber_tree_reload
+	RUN_TEST fp$name_ft_hot,    fp$test_fiber_tree_hot_replace
+
 	; summary + isa-debug-exit; never returns
 	call	fp$test_summary_and_exit
 
@@ -238,6 +247,360 @@ fp$test_syscall:
 	mov	eax, 1
 	ret
 
+; =============================================================================
+; Cordis fiber-tree tests
+; -----------------------
+; A small component tree is built and torn down to prove the Cordis
+; primitives:
+;
+;     A (provides KEY_X)
+;     └── B (injects KEY_X, provides KEY_Y)
+;         └── C (injects KEY_X, KEY_Y)
+;
+; Fiber ids are fixed test slots; keys and values are small integers. Each
+; test is self-contained: it resets the registry, drives the Cordis handlers
+; directly (the same code the SYSCALL dispatcher reaches), and asserts on the
+; resulting fiber states and coeffect contents.
+;
+; The inverse used for effect tracking increments a counter, so a test can
+; confirm exactly how many effects were reverted on unload/rollback.
+; =============================================================================
+
+; test fiber ids (registry slots)
+FT_FIBER_A	= 1
+FT_FIBER_B	= 2
+FT_FIBER_C	= 3
+
+; test dependency keys (arbitrary unique tokens)
+FT_KEY_X	= 0x1001
+FT_KEY_Y	= 0x1002
+
+; values supplied by providers (distinct so hot-replace is observable)
+FT_VAL_A	= 0xAAAA
+FT_VAL_A_PRIME	= 0xBBBB
+
+; =============================================================================
+; fp$ft_inverse — test inverse function. Increments fp$ft_revert_count.
+;   CONTRACT: IN rdi = context (ignored); OUT nothing; CLOBBERS rax, flags.
+; =============================================================================
+align 16
+fp$ft_inverse:
+	inc	qword [fp$ft_revert_count]
+	ret
+
+; fp$ft_reset — clear the registry for a clean, self-contained test.
+;   CONTRACT: CLOBBERS rax, rcx, rdx, rdi.
+align 16
+fp$ft_reset:
+	mov	qword [fp$ft_revert_count], 0
+	call	fp$cordis_init
+	ret
+
+; =============================================================================
+; Test 9 — fiber_tree_dependency_chain
+;   Load A (provides KEY_X), B (injects KEY_X, provides KEY_Y),
+;   C (injects KEY_X + KEY_Y). Assert all become ACTIVE and provisions land
+;   in the coeffect table.
+; =============================================================================
+align 16
+fp$test_fiber_tree_chain:
+	call	fp$ft_reset
+	; --- A provides KEY_X = FT_VAL_A ---
+	mov	rdi, FT_FIBER_A
+	mov	rsi, FT_KEY_X
+	mov	rdx, FT_VAL_A
+	call	fp$coeffect_provide
+	test	rax, rax
+	jnz	.fail
+	mov	rdi, FT_FIBER_A
+	call	fp$fiber_load
+	test	rax, rax			; 0 = active
+	jnz	.fail
+	mov	rdi, FT_FIBER_A
+	call	fp$fiber_state
+	cmp	rax, FIBER_ACTIVE
+	jne	.fail
+	; KEY_X must resolve to FT_VAL_A
+	mov	rdi, FT_KEY_X
+	call	fp$coeffect_lookup
+	cmp	rax, FT_VAL_A
+	jne	.fail
+	; --- B injects KEY_X, provides KEY_Y ---
+	mov	rdi, FT_FIBER_B
+	mov	rsi, FT_KEY_X
+	call	fp$coeffect_declare
+	test	rax, rax
+	jnz	.fail
+	mov	rdi, FT_FIBER_B
+	mov	rsi, FT_KEY_Y
+	mov	rdx, 0xB0B0
+	call	fp$coeffect_provide
+	test	rax, rax
+	jnz	.fail
+	mov	rdi, FT_FIBER_B
+	call	fp$fiber_load
+	test	rax, rax
+	jnz	.fail
+	mov	rdi, FT_FIBER_B
+	call	fp$fiber_state
+	cmp	rax, FIBER_ACTIVE
+	jne	.fail
+	; KEY_Y must now be in the table
+	mov	rdi, FT_KEY_Y
+	call	fp$coeffect_lookup
+	cmp	rax, 0xB0B0
+	jne	.fail
+	; --- C injects KEY_X and KEY_Y ---
+	mov	rdi, FT_FIBER_C
+	mov	rsi, FT_KEY_X
+	call	fp$coeffect_declare
+	test	rax, rax
+	jnz	.fail
+	mov	rdi, FT_FIBER_C
+	mov	rsi, FT_KEY_Y
+	call	fp$coeffect_declare
+	test	rax, rax
+	jnz	.fail
+	mov	rdi, FT_FIBER_C
+	call	fp$fiber_load
+	test	rax, rax			; both deps satisfied -> active
+	jnz	.fail
+	mov	rdi, FT_FIBER_C
+	call	fp$fiber_state
+	cmp	rax, FIBER_ACTIVE
+	jne	.fail
+	xor	eax, eax			; PASS
+	ret
+      .fail:
+	mov	eax, 1
+	ret
+
+; =============================================================================
+; Test 10 — fiber_tree_root_unload
+;   Build A->B->C, give A a revertible effect, then unload A. Assert B and C
+;   deactivate, A's effect is reverted, and the coeffect table is clean.
+; =============================================================================
+align 16
+fp$test_fiber_tree_unload:
+	call	fp$ft_reset
+	; build the chain (same as test 9)
+	call	fp$ft_build_chain
+	test	rax, rax
+	jnz	.fail
+	; record a revertible effect on A
+	mov	rdi, FT_FIBER_A
+	mov	rsi, fp$ft_inverse
+	mov	rdx, 0
+	call	fp$effect_record
+	test	rax, rax
+	js	.fail
+	; sanity: all three active
+	mov	rdi, FT_FIBER_A
+	call	fp$fiber_state
+	cmp	rax, FIBER_ACTIVE
+	jne	.fail
+	mov	rdi, FT_FIBER_B
+	call	fp$fiber_state
+	cmp	rax, FIBER_ACTIVE
+	jne	.fail
+	mov	rdi, FT_FIBER_C
+	call	fp$fiber_state
+	cmp	rax, FIBER_ACTIVE
+	jne	.fail
+	; --- unload the root provider A ---
+	mov	rdi, FT_FIBER_A
+	call	fp$fiber_unload
+	test	rax, rax			; 0 = fully unloaded
+	jnz	.fail
+	; A must be Inactive and its effect reverted
+	mov	rdi, FT_FIBER_A
+	call	fp$fiber_state
+	cmp	rax, FIBER_INACTIVE
+	jne	.fail
+	cmp	qword [fp$ft_revert_count], 1
+	jne	.fail
+	; B and C must have deactivated (their deps disappeared)
+	mov	rdi, FT_FIBER_B
+	call	fp$fiber_state
+	cmp	rax, FIBER_INACTIVE
+	jne	.fail
+	mov	rdi, FT_FIBER_C
+	call	fp$fiber_state
+	cmp	rax, FIBER_INACTIVE
+	jne	.fail
+	; coeffect table must be clean: KEY_X and KEY_Y unprovided
+	mov	rdi, FT_KEY_X
+	call	fp$coeffect_lookup
+	cmp	rax, CORDIS_NIL
+	jne	.fail
+	mov	rdi, FT_KEY_Y
+	call	fp$coeffect_lookup
+	cmp	rax, CORDIS_NIL
+	jne	.fail
+	xor	eax, eax			; PASS
+	ret
+      .fail:
+	mov	eax, 1
+	ret
+
+; =============================================================================
+; Test 11 — fiber_tree_root_reload
+;   Build A->B->C, unload A, then reload A, B, C. Assert all re-activate and
+;   bindings resolve again.
+; =============================================================================
+align 16
+fp$test_fiber_tree_reload:
+	call	fp$ft_reset
+	call	fp$ft_build_chain
+	test	rax, rax
+	jnz	.fail
+	; unload root
+	mov	rdi, FT_FIBER_A
+	call	fp$fiber_unload
+	test	rax, rax
+	jnz	.fail
+	; reload A -> B -> C
+	call	fp$ft_build_chain
+	test	rax, rax
+	jnz	.fail
+	; all must be Active again
+	mov	rdi, FT_FIBER_A
+	call	fp$fiber_state
+	cmp	rax, FIBER_ACTIVE
+	jne	.fail
+	mov	rdi, FT_FIBER_B
+	call	fp$fiber_state
+	cmp	rax, FIBER_ACTIVE
+	jne	.fail
+	mov	rdi, FT_FIBER_C
+	call	fp$fiber_state
+	cmp	rax, FIBER_ACTIVE
+	jne	.fail
+	; bindings correct
+	mov	rdi, FT_KEY_X
+	call	fp$coeffect_lookup
+	cmp	rax, FT_VAL_A
+	jne	.fail
+	xor	eax, eax			; PASS
+	ret
+      .fail:
+	mov	eax, 1
+	ret
+
+; =============================================================================
+; Test 12 — fiber_tree_hot_replace
+;   Build A->B->C, then replace A with A' providing the same KEY_X but a new
+;   value. Assert B and C deactivate then re-activate against A', and now see
+;   the new value.
+; =============================================================================
+align 16
+fp$test_fiber_tree_hot_replace:
+	call	fp$ft_reset
+	call	fp$ft_build_chain
+	test	rax, rax
+	jnz	.fail
+	; hot-replace: unload A (B and C deactivate), then provide KEY_X with a
+	; NEW value from A and reload the tree.
+	mov	rdi, FT_FIBER_A
+	call	fp$fiber_unload
+	test	rax, rax
+	jnz	.fail
+	; A' provides KEY_X = FT_VAL_A_PRIME
+	mov	rdi, FT_FIBER_A
+	mov	rsi, FT_KEY_X
+	mov	rdx, FT_VAL_A_PRIME
+	call	fp$coeffect_provide
+	test	rax, rax
+	jnz	.fail
+	mov	rdi, FT_FIBER_A
+	call	fp$fiber_load
+	test	rax, rax
+	jnz	.fail
+	; reload B and C against A'
+	mov	rdi, FT_FIBER_B
+	mov	rsi, FT_KEY_X
+	call	fp$coeffect_declare
+	mov	rdi, FT_FIBER_B
+	mov	rsi, FT_KEY_Y
+	mov	rdx, 0xB0B0
+	call	fp$coeffect_provide
+	mov	rdi, FT_FIBER_B
+	call	fp$fiber_load
+	test	rax, rax
+	jnz	.fail
+	mov	rdi, FT_FIBER_C
+	mov	rsi, FT_KEY_X
+	call	fp$coeffect_declare
+	mov	rdi, FT_FIBER_C
+	mov	rsi, FT_KEY_Y
+	call	fp$coeffect_declare
+	mov	rdi, FT_FIBER_C
+	call	fp$fiber_load
+	test	rax, rax
+	jnz	.fail
+	; all active again
+	mov	rdi, FT_FIBER_C
+	call	fp$fiber_state
+	cmp	rax, FIBER_ACTIVE
+	jne	.fail
+	; KEY_X now resolves to the NEW value, not the old one
+	mov	rdi, FT_KEY_X
+	call	fp$coeffect_lookup
+	cmp	rax, FT_VAL_A_PRIME
+	jne	.fail
+	xor	eax, eax			; PASS
+	ret
+      .fail:
+	mov	eax, 1
+	ret
+
+; =============================================================================
+; fp$ft_build_chain — helper: build A->B->C with A providing KEY_X=FT_VAL_A.
+;   CONTRACT: OUT rax = 0 on success, 1 on failure; CLOBBERS rax, rcx, rdx,
+;             rsi, rdi.
+; =============================================================================
+align 16
+fp$ft_build_chain:
+	; A provides KEY_X
+	mov	rdi, FT_FIBER_A
+	mov	rsi, FT_KEY_X
+	mov	rdx, FT_VAL_A
+	call	fp$coeffect_provide
+	test	rax, rax
+	jnz	.fail
+	mov	rdi, FT_FIBER_A
+	call	fp$fiber_load
+	test	rax, rax
+	jnz	.fail
+	; B injects KEY_X, provides KEY_Y
+	mov	rdi, FT_FIBER_B
+	mov	rsi, FT_KEY_X
+	call	fp$coeffect_declare
+	mov	rdi, FT_FIBER_B
+	mov	rsi, FT_KEY_Y
+	mov	rdx, 0xB0B0
+	call	fp$coeffect_provide
+	mov	rdi, FT_FIBER_B
+	call	fp$fiber_load
+	test	rax, rax
+	jnz	.fail
+	; C injects KEY_X and KEY_Y
+	mov	rdi, FT_FIBER_C
+	mov	rsi, FT_KEY_X
+	call	fp$coeffect_declare
+	mov	rdi, FT_FIBER_C
+	mov	rsi, FT_KEY_Y
+	call	fp$coeffect_declare
+	mov	rdi, FT_FIBER_C
+	call	fp$fiber_load
+	test	rax, rax
+	jnz	.fail
+	xor	eax, eax
+	ret
+      .fail:
+	mov	eax, 1
+	ret
+
 ; -----------------------------------------------------------------------------
 ; Read-only data: test names and the heartbeat newline.
 ; -----------------------------------------------------------------------------
@@ -249,7 +612,16 @@ fp$name_paging	db 'paging', 0
 fp$name_exception db 'exception', 0
 fp$name_context	db 'context', 0
 fp$name_syscall	db 'syscall', 0
+fp$name_ft_chain db 'fiber_tree_dependency_chain', 0
+fp$name_ft_unload db 'fiber_tree_root_unload', 0
+fp$name_ft_reload db 'fiber_tree_root_reload', 0
+fp$name_ft_hot	db 'fiber_tree_hot_replace', 0
 fp$hello_str	db 'Hello from serial', 0
 fp$heartbeat_nl	db 10, 0
+
+; test-mutable state (writable): the effect-revert counter incremented by
+; fp$ft_inverse so the fiber-tree tests can count reverted effects.
+align 8
+fp$ft_revert_count dq 0
 
 end if ; FP_OS_TESTS_INC
