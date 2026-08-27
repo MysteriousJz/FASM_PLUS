@@ -59,8 +59,14 @@ PCI_VENDOR_ABSENT  = 0xFFFF
 
 ; config-space register offsets (byte offsets; the low 2 bits are dropped)
 PCI_REG_ID         = 0x00        ; vendor + device id
+PCI_REG_COMMAND    = 0x04        ; command register (I/O space, memory space, bus master)
 PCI_REG_CLASS      = 0x08        ; class/subclass/progif/revision
 PCI_REG_BAR0       = 0x10        ; first base address register
+
+; PCI command register bits
+PCI_CMD_IO_SPACE     = 0x01      ; respond to I/O-space accesses
+PCI_CMD_MEMORY_SPACE = 0x02      ; respond to memory-space accesses (BARs)
+PCI_CMD_BUS_MASTER   = 0x04      ; enable bus mastering
 
 ; table capacity
 PCI_MAX_DEVICES    = 64
@@ -249,6 +255,53 @@ fp$pci_enumerate:
 	pop	r13
 	pop	r12
 	pop	rbx
+	ret
+
+; =============================================================================
+; fp$pci_enable_device — set Memory Space + Bus Master + I/O Space on a device
+;   CONTRACT
+;     IN        : rdi = bus, rsi = device, rdx = function
+;     OUT       : rax = the new command register value
+;     CLOBBERS  : rax, rcx, rdx, flags
+;     PRESERVES : rbx, rbp, rsi, rdi, r8-r15
+;     ERRORS    : none
+;   A PCI device's BARs are not accessible until the Memory Space Enable bit
+;   (command register bit 1) is set. Firmware usually sets it, but a kernel
+;   that programs a device directly (e.g. the Bochs BGA framebuffer) must set
+;   it or the BAR-backed memory will fault on access. This is the missing
+;   piece that makes the QEMU BGA framebuffer writable.
+; =============================================================================
+align 16
+fp$pci_enable_device:
+	; read the current command register (offset 0x04)
+	push	rdi
+	push	rsi
+	push	rdx
+	mov	rcx, PCI_REG_COMMAND
+	call	fp$pci_read_dword
+	mov	r8, rax			; r8 = current command
+	pop	rdx
+	pop	rsi
+	pop	rdi
+	; set IO + Memory Space + Bus Master, preserving the rest
+	or	r8, PCI_CMD_IO_SPACE or PCI_CMD_MEMORY_SPACE or PCI_CMD_BUS_MASTER
+	; write it back (config write: address, then data)
+	push	rdi
+	push	rsi
+	push	rdx
+	push	rcx
+	mov	rcx, PCI_REG_COMMAND
+	call	fp$pci_config_address	; rax = CONFIG_ADDRESS
+	mov	rdx, PCI_CONFIG_ADDRESS
+	out	dx, eax
+	mov	rdx, PCI_CONFIG_DATA
+	mov	eax, r8d
+	out	dx, eax			; write the new command dword
+	pop	rcx
+	pop	rdx
+	pop	rsi
+	pop	rdi
+	mov	rax, r8
 	ret
 
 ; =============================================================================

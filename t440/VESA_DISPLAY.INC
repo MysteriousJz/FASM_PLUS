@@ -154,10 +154,19 @@ fp$vesa_detect:
 	call	fp$pci_find_class
 	cmp	rax, -1
 	je	.fail
-	; slot -> table entry -> BAR0
+	; slot -> table entry
 	mov	rcx, PCI_DEV_SIZE
 	imul	rax, rcx
 	add	rax, fp$pci_device_table
+	; enable the device's memory space (and bus mastering) or its BAR-backed
+	; framebuffer is not mapped and any LFB write faults. The table entry
+	; carries bus/device/function for exactly this.
+	push	rax
+	mov	rdi, [rax + pci_dev.bus]
+	mov	rsi, [rax + pci_dev.device]
+	mov	rdx, [rax + pci_dev.function]
+	call	fp$pci_enable_device
+	pop	rax
 	mov	rcx, [rax + pci_dev.bar0]
 	and	ecx, 0xFFFFFFF0		; mask BAR flags -> memory base (32-bit op)
 	; store the mode block
@@ -194,11 +203,9 @@ fp$vesa_putpixel:
 	mov	rax, qword [fp$display_mode_block + display_mode.lfb]
 	test	rax, rax
 	jz	.out			; no framebuffer -> drop the pixel
-	; only write if the LFB is within the identity-mapped first 1 GB
-	mov	rcx, rax
-	shr	rcx, 30
-	test	rcx, rcx
-	jnz	.out			; LFB in an unmapped MMIO hole -> drop
+	; The framebuffer's physical range is mapped into the page tables before
+	; the driver activates (fp$paging_map_range), so any LFB address is
+	; writable. No address guard is needed here.
 	; bounds check
 	cmp	rdi, qword [fp$display_mode_block + display_mode.width]
 	jae	.out
@@ -232,14 +239,8 @@ fp$vesa_clear:
 	mov	rcx, qword [fp$display_mode_block + display_mode.lfb]
 	test	rcx, rcx
 	jz	.out
-	; Only clear if the LFB is within the identity-mapped first 1 GB, which
-	; is guaranteed present. A higher LFB (QEMU's 0xFD000000 MMIO hole) would
-	; fault under the current 4 GB-with-holes map, so skip the fill there and
-	; let fp$vesa_putpixel clip per-pixel instead.
-	mov	rax, rcx
-	shr	rax, 30			; LFB / 1GB
-	test	rax, rax
-	jnz	.out
+	; The framebuffer is mapped before the driver activates, so the fill runs
+	; regardless of the LFB address.
 	mov	rax, qword [fp$display_mode_block + display_mode.width]
 	mov	rdx, qword [fp$display_mode_block + display_mode.height]
 	imul	rax, rdx		; rax = pixel count = dwords to write
@@ -272,42 +273,46 @@ fp$vesa_putchar:
 	push	r13
 	push	r14
 	push	r15
-	; glyph row base = font + char*16
-	and	rdx, 0xFF		; char
+	; fp$vesa_putpixel clobbers rcx and r8, so the two values we need across
+	; every pixel call — the glyph base pointer and the foreground color —
+	; are parked in BSS slots before the loop.
+	mov	[fp$vesa_fg_color], rcx		; fg color (in)
+	; glyph base = font + char*16
+	and	rdx, 0xFF			; char
 	mov	rax, rdx
-	shl	rax, 4			; char*16 (shift, no mul)
-	lea	r8, [fp$font8x16]
-	add	r8, rax			; r8 = &glyph[0]
+	shl	rax, 4				; char*16 (shift, no mul)
+	lea	rcx, [fp$font8x16]
+	add	rcx, rax
+	mov	[fp$vesa_glyph_ptr], rcx	; &glyph[0]
 	; pixel origin
 	mov	r12, rdi
-	shl	r12, 3			; x = col*8
+	shl	r12, 3				; x = col*8
 	mov	r13, rsi
-	shl	r13, 4			; y = row*16
-	mov	r14, rcx		; r14 = fg color
-	xor	r15, r15		; r15 = glyph row (0..15)
+	shl	r13, 4				; y = row*16
+	xor	r15, r15			; r15 = glyph row (0..15)
       .row:
 	cmp	r15, VESA_FONT_H
 	jae	.done
-	movzx	ebx, byte [r8 + r15]	; row bitmask
-	; for each of 8 pixels (bit 7 = leftmost)
-	xor	r11, r11		; r11 = column bit (0..7)
+	mov	rbx, [fp$vesa_glyph_ptr]
+	movzx	ebx, byte [rbx + r15]		; row bitmask
+	xor	r14, r14			; r14 = column bit (0..7)
       .col:
-	cmp	r11, VESA_FONT_W
+	cmp	r14, VESA_FONT_W
 	jae	.nextrow
-	; test bit (7 - col)
+	; test bit (7 - col) of the row bitmask
 	mov	ecx, 7
-	sub	ecx, r11d
+	sub	ecx, r14d
 	bt	ebx, ecx
 	jnc	.pixel_bg
-	mov	rdx, r14		; fg
+	mov	rdx, [fp$vesa_fg_color]		; foreground
 	jmp	.plot
       .pixel_bg:
-	xor	edx, edx		; bg = black
+	xor	edx, edx			; background = black
       .plot:
-	lea	rdi, [r12 + r11]	; x = origin_x + col
-	lea	rsi, [r13 + r15]	; y = origin_y + row
-	call	fp$vesa_putpixel
-	inc	r11
+	lea	rdi, [r12 + r14]		; x = origin_x + col
+	lea	rsi, [r13 + r15]		; y = origin_y + row
+	call	fp$vesa_putpixel		; preserves rbx, r12-r15
+	inc	r14
 	jmp	.col
       .nextrow:
 	inc	r15
@@ -396,10 +401,25 @@ fp$vesa_apply:
 	call	fp$effect_record
 	test	rax, rax
 	js	.fail
-	; establish the framebuffer
+	; establish the framebuffer (fills fp$display_mode_block). By now the
+	; LFB address is known — from the Multiboot2 framebuffer tag (T440) or
+	; from the Bochs BGA + PCI BAR (QEMU).
 	call	fp$vesa_detect
 	test	rax, rax
 	jnz	.fail
+	; Map the framebuffer's physical range into the page tables so the CPU
+	; can write it. The byte count is pitch * height (the pitch may exceed
+	; width * bytes-per-pixel). This runs AFTER the address is known and
+	; BEFORE any drawing.
+	mov	rdi, qword [fp$display_mode_block + display_mode.lfb]
+	mov	rax, qword [fp$display_mode_block + display_mode.pitch]
+	mov	rcx, qword [fp$display_mode_block + display_mode.height]
+	imul	rax, rcx		; rax = pitch * height = framebuffer bytes
+	mov	rsi, rax
+	call	fp$paging_map_range
+	; flush the TLB so the new framebuffer mappings take effect immediately
+	mov	rax, cr3
+	mov	cr3, rax
 	; clear the screen to black so the heartbeat is readable
 	xor	rdi, rdi
 	call	fp$vesa_clear

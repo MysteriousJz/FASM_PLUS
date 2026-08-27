@@ -211,6 +211,11 @@ use64
     ; display mode block (lfb, width, height, pitch, bpp)
     align 64
     fp$display_mode_block rb DISPLAY_MODE_SIZE
+    ; putchar scratch slots (glyph base + fg color survive fp$vesa_putpixel,
+    ; which clobbers rcx/r8)
+    align 8
+    fp$vesa_glyph_ptr rq 1
+    fp$vesa_fg_color rq 1
     ; keyboard ring buffer + indices + flags
     align 64
     fp$kbd_buffer	rb KBD_BUF_SIZE

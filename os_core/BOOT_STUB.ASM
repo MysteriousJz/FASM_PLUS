@@ -214,8 +214,12 @@ _start:
 	jne	.fail_magic
 	; Multiboot2: EBX points at the boot-information structure. Copy the
 	; framebuffer tag (if present) into the display mode block now, before
-	; serial init clobbers EAX and before the long-mode switch.
+	; serial init clobbers EAX and before the long-mode switch. The copy only
+	; happens when the image defines a display mode block (the T440 layer
+	; does; the bare OS core does not), keeping the core build standalone.
+	if definite fp$display_mode_block
 	FP_MB2_COPY_FB
+	end if
 	jmp	.magic_ok
       .magic_ok:
 	; initialize COM1 inline (before paging) so failures are visible.
@@ -256,20 +260,23 @@ _start:
 	add	edi, 4
 	dec	ecx
 	jnz	.clear
-	; PML4[0..3] -> PDPT0..3 (present + writable)
+	; A correct 4 GB identity map needs only ONE PML4 entry and ONE PDPT,
+	; because the whole 4 GB fits under a single PML4 slot (PML4[0] spans
+	; 512 GB). The four 1 GB regions live in PDPT0[0..3], each pointing at
+	; one PD of 512 x 2 MB large pages:
+	;   PML4[0]    -> PDPT0
+	;   PDPT0[0..3]-> PD0..PD3   (PDn covers [n GB, (n+1) GB))
+	; The previous layout (PML4[n]->PDPTn, PDPTn[0]->PDn) only mapped the
+	; first 1 GB correctly; addresses above 1 GB walked into an empty
+	; PDPT0 slot and page-faulted. That was the framebuffer bug: the LFB at
+	; 0xFD000000 (3.79 GB) was never actually mapped.
+	; PML4[0] -> PDPT0 (present + writable)
 	mov	edi, PML4_BASE
-	mov	esi, PML4_BASE + 0x1000	; PDPT0
-	mov	ecx, 4
-      .pml4:
-	mov	eax, esi
+	mov	eax, PML4_BASE + 0x1000	; PDPT0
 	or	eax, PTE_P_BIT or PTE_RW_BIT
 	mov	[edi], eax
 	mov	dword [edi + 4], 0	; high dword of the entry
-	add	edi, 8
-	add	esi, 0x1000
-	dec	ecx
-	jnz	.pml4
-	; PDPTn[0] -> PDn (present + writable)
+	; PDPT0[0..3] -> PD0..3 (present + writable)
 	mov	edi, PML4_BASE + 0x1000	; PDPT0
 	mov	esi, PML4_BASE + 0x5000	; PD0
 	mov	ecx, 4
@@ -278,7 +285,7 @@ _start:
 	or	eax, PTE_P_BIT or PTE_RW_BIT
 	mov	[edi], eax
 	mov	dword [edi + 4], 0
-	add	edi, 0x1000		; next PDPT page
+	add	edi, 8			; next PDPT0 entry (8 bytes each)
 	add	esi, 0x1000		; next PD page
 	dec	ecx
 	jnz	.pdpt

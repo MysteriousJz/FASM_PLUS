@@ -150,33 +150,31 @@ fp$paging_identity_map_4gb:
 	add	rsi, 8
 	dec	ecx
 	jnz	.clear
-	; PML4[0..3] -> PDPT0..3 (present, writable, supervisor)
+	; Correct 4 GB identity map: one PML4 entry, one PDPT. The whole 4 GB
+	; fits under PML4[0] (each PML4 slot spans 512 GB), and PDPT0[0..3] each
+	; point at one PD of 512 x 2 MB large pages.
+	;   PML4[0]     -> PDPT0
+	;   PDPT0[0..3] -> PD0..PD3   (PDn covers [n GB, (n+1) GB))
+	; PML4[0] -> PDPT0 (present, writable, supervisor)
 	mov	rcx, rdi		; PML4 cursor
 	mov	rsi, rdi
 	add	rsi, ALIGN_PAGE		; PDPT0 address
-	mov	edx, 4			; four PDPTs (one per GB)
-      .pml4:
 	mov	rax, rsi
 	or	rax, PTE_P_BIT or PTE_RW_BIT
-	mov	[rcx], rax
-	add	rcx, 8
-	add	rsi, ALIGN_PAGE		; next PDPT page
-	dec	edx
-	jnz	.pml4
-	; each PDPT[0] -> PDn (present, writable), then fill PDn with 512
-	; 2 MB large pages covering [n*1GB, (n+1)*1GB). r10 tracks the PD
-	; index because the PD base alone cannot be recovered once rcx
-	; advances into the entries.
+	mov	[rcx], rax		; PML4[0]
+	; PDPT0[0..3] -> PD0..3 (present, writable), filling each PD with 512
+	; 2 MB large pages covering [n*1GB, (n+1)*1GB). The PDPT cursor advances
+	; by 8 bytes per entry (one PDPT slot per PD), the PD cursor by a page.
 	mov	rsi, rdi
-	add	rsi, ALIGN_PAGE		; PDPT cursor
+	add	rsi, ALIGN_PAGE		; PDPT0 base
 	mov	rcx, rdi
 	add	rcx, ALIGN_PAGE * 5	; PD0 address
 	xor	r8d, r8d		; PD index 0..3
       .pdpt:
 	mov	rax, rcx
 	or	rax, PTE_P_BIT or PTE_RW_BIT
-	mov	[rsi], rax		; PDPT[0] -> PDn
-	add	rsi, ALIGN_PAGE		; next PDPT
+	mov	[rsi], rax		; PDPT0[n] -> PDn
+	add	rsi, 8			; next PDPT0 entry (8 bytes)
 	; fill the PD at rcx with 512 large pages
 	mov	r9d, PD_ENTRIES
 	mov	rax, r8
@@ -196,6 +194,93 @@ fp$paging_identity_map_4gb:
 	ret
       .bad_align:
 	mov	rax, E_ALIGNMENT
+	ret
+
+; =============================================================================
+; fp$paging_map_range — map a physical range into the boot page tables
+;   CONTRACT
+;     IN        : rdi = physical base address, rsi = length in bytes
+;     OUT       : rax = 0 on success, E_ALIGNMENT if base is not 2 MB aligned
+;                 after rounding down (we round down internally, so always 0)
+;     CLOBBERS  : rax, rcx, rdx, r8, r9, r10, flags
+;     PRESERVES : rbx, rbp, r12-r15, rsi, rdi
+;     ERRORS    : none for the supported case (base below 4 GB)
+;   Maps [base, base+length) using 2 MB large pages in the boot page tables
+;   rooted at PML4_BASE (0x90000): PML4 -> PDPT -> PD -> 2 MB page. Each PD
+;   entry is written present + writable + large-page. The base is rounded DOWN
+;   to a 2 MB boundary and the length is rounded UP to whole 2 MB pages, so a
+;   framebuffer that starts mid-page is fully covered.
+;
+;   Only the first 4 GB are handled (the boot identity map builds PML4[0..3]
+;   and PD0..3). If the base is at or above 4 GB the function is a no-op and
+;   returns E_OUT_OF_RANGE — a safe, detectable answer rather than a partial
+;   map. For QEMU's Bochs BGA (LFB at 0xFD000000) and the T440's VESA modes,
+;   the LFB is below 4 GB.
+;
+;   No division: the PD index is a shift, and the per-GB PD base is found by
+;   shifting the index.
+; =============================================================================
+align 16
+fp$paging_map_range:
+	push	rbx
+	push	r12
+	push	r13
+	push	r14
+	mov	r12, rdi		; r12 = base
+	mov	r13, rsi		; r13 = length
+	; reject a base at or above 4 GB (only PML4[0..3]/PD0..3 exist)
+	mov	rax, r12
+	shr	rax, 32			; high dword
+	jnz	.out_of_range
+	; round base down to a 2 MB boundary
+	mov	rax, r12
+	and	rax, PD_ENTRY_SPAN - 1	; offset within the 2 MB page
+	sub	r12, rax		; r12 = aligned base
+	add	r13, rax		; grow length by the offset we removed
+	; round length up to a whole number of 2 MB pages:
+	;   pages = (length + 2MB - 1) shr 21
+	mov	rax, r13
+	add	rax, PD_ENTRY_SPAN - 1
+	shr	rax, 21			; rax = page count
+	mov	r14, rax		; r14 = pages to map
+	; PD index of the aligned base
+	mov	rbx, r12
+	shr	rbx, 21			; rbx = PD entry index (0..2047)
+      .map_loop:
+	test	r14, r14
+	jz	.done
+	; PD base for this index: PDs are contiguous at 0x95000, 512 entries each.
+	; PDn base = 0x95000 + (index shr 9) * 0x1000 ; entry offset = (index and 511)*8
+	mov	rax, rbx
+	shr	rax, 9			; which PD (0..3)
+	shl	rax, 12			; x 4 KB per PD page
+	add	rax, 0x95000		; PD base (PD0 is at 0x95000)
+	mov	rcx, rbx
+	and	rcx, 511		; entry within the PD
+	shl	rcx, 3			; x 8 bytes per entry
+	add	rax, rcx		; rax = &PD[index]
+	; entry value = physical base of this 2 MB page, present+writable+large
+	mov	rdx, rbx
+	shl	rdx, 21			; physical base = index * 2 MB
+	or	rdx, PTE_P_BIT or PTE_RW_BIT or PTE_PS_BIT
+	mov	[rax], edx		; low dword (below 4 GB)
+	mov	dword [rax + 4], 0	; high dword
+	inc	rbx			; next PD index
+	dec	r14
+	jmp	.map_loop
+      .done:
+	xor	eax, eax
+	pop	r14
+	pop	r13
+	pop	r12
+	pop	rbx
+	ret
+      .out_of_range:
+	mov	rax, E_OUT_OF_RANGE
+	pop	r14
+	pop	r13
+	pop	r12
+	pop	rbx
 	ret
 
 ; =============================================================================
