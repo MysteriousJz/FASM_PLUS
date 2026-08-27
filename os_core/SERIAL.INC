@@ -140,14 +140,15 @@ fp$serial_write:
 ; =============================================================================
 align 16
 fp$serial_write_hex:
-	mov	rcx, rdi		; value
+	push	rbx			; rbx = value (survives every call)
+	push	r12			; r12 = nibble counter
+	mov	rbx, rdi
 	mov	rdi, fp$serial_hex_prefix
 	call	fp$serial_write		; "0x"
-	mov	rdi, rcx
-	mov	ecx, 16			; 16 nibbles
+	mov	r12d, 16		; 16 nibbles
       .digit:
-	rol	rdi, 4			; bring next nibble into low bits
-	mov	rax, rdi
+	rol	rbx, 4			; bring next nibble into the low bits
+	mov	rax, rbx
 	and	rax, 0x0F
 	cmp	al, 10
 	jb	.dec
@@ -156,12 +157,12 @@ fp$serial_write_hex:
       .dec:
 	add	al, '0'
       .emit:
-	push	rcx
-	movzx	edi, al
-	call	fp$serial_putchar
-	pop	rcx
-	dec	ecx
+	movzx	edi, al			; digit character
+	call	fp$serial_putchar	; preserves rbx and r12
+	dec	r12d
 	jnz	.digit
+	pop	r12
+	pop	rbx
 	ret
 
 ; =============================================================================

@@ -27,6 +27,12 @@ if ~ definite FP_KERNEL_TEST_INC
   err 'OS_TESTS.INC requires KERNEL_TEST.INC (and all lower components) first'
 end if
 
+; The OS core test runner is defined below. A target-specific image (for
+; example the T440 build) may define FP_OS_TESTS_NO_RUNNER before including
+; this file to suppress fp$run_all_tests and supply its own runner that also
+; invokes the target's extra tests.
+if ~ definite FP_OS_TESTS_NO_RUNNER
+
 ; =============================================================================
 ; fp$run_all_tests
 ;   CONTRACT
@@ -70,6 +76,8 @@ fp$run_all_tests:
 
 	; summary + isa-debug-exit; never returns
 	call	fp$test_summary_and_exit
+
+end if ; ~ definite FP_OS_TESTS_NO_RUNNER
 
 ; =============================================================================
 ; Test 1 — boot

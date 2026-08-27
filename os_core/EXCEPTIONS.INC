@@ -119,23 +119,24 @@ align 16
 fp$exception_handler:
 	; preserve all general registers before touching anything
 	PUSHAQ
-	; after PUSHAQ the stack is: [rsp]=rdi..[rsp+56]=rax, then the
-	; vector at [rsp+64], error code at [rsp+72], RIP at [rsp+80]
+	; PUSHAQ pushes 15 qwords (120 bytes). Before it, the stub pushed the
+	; vector at [rsp] and the error code at [rsp+8], so after PUSHAQ:
+	;   [rsp+120] = vector, [rsp+128] = error, [rsp+136] = RIP
 	; print "EXC "
 	mov	rdi, fp$exc_str
 	call	fp$serial_write
 	; vector number
-	mov	rdi, [rsp + 64]
+	mov	rdi, [rsp + 120]
 	call	fp$serial_write_dec
 	; " RIP="
 	mov	rdi, fp$exc_rip_str
 	call	fp$serial_write
-	mov	rdi, [rsp + 80]
+	mov	rdi, [rsp + 136]
 	call	fp$serial_write_hex
 	; " ERR="
 	mov	rdi, fp$exc_err_str
 	call	fp$serial_write
-	mov	rdi, [rsp + 72]
+	mov	rdi, [rsp + 128]
 	call	fp$serial_write_hex
 	; " CR2="
 	mov	rdi, fp$exc_cr2_str
