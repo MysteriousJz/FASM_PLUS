@@ -1,0 +1,308 @@
+; =============================================================================
+; FASM_PLUS OS Core — PAGING.INC
+; Page table construction for the identity-mapped first 4 GB.
+;
+; Depends on: BIT_MATH.INC (bit constants and alignment), CONSTANTS.INC
+; Emits: macros (inline at call site) and functions in the code section.
+;
+; The kernel uses 4-level paging with 2 MB large pages:
+;   PML4 -> PDPT -> PD -> (2 MB page)
+; A full 4 GB identity map needs 1 PML4, 4 PDPTs, and 4 PDs (one PD per GB),
+; because each PD holds 512 entries x 2 MB = 1 GB.
+;
+; Page table entry bit layout (both 4 KB and 2 MB pages):
+;   bit 0   P   present
+;   bit 1   RW  read/write
+;   bit 2   US  user/supervisor (0 = supervisor)
+;   bit 5   A   accessed
+;   bit 6   D   dirty (2 MB pages)
+;   bit 7   PS  page size (1 = 2 MB large page, only in PD)
+;   bit 63  NX  no-execute
+;
+; Macros expand inline and emit the obvious bit operation — no hidden work.
+; =============================================================================
+
+if ~ definite FP_PAGING_INC
+FP_PAGING_INC = 1
+
+if ~ definite FP_BIT_MATH_INC
+  err 'PAGING.INC requires BIT_MATH.INC (and CONSTANTS.INC, CONTRACTS.INC) first'
+end if
+
+; -----------------------------------------------------------------------------
+; Page table entry flag bits (bare values for data construction)
+; -----------------------------------------------------------------------------
+PTE_P_BIT       = 0x001         ; present
+PTE_RW_BIT      = 0x002         ; read/write
+PTE_US_BIT      = 0x004         ; user
+PTE_A_BIT       = 0x020         ; accessed
+PTE_D_BIT       = 0x040         ; dirty
+PTE_PS_BIT      = 0x080         ; page size (2 MB large page)
+PTE_NX_BIT      = 0x8000000000000000  ; no execute
+PTE_ADDR_MASK   = 0x000FFFFFFFFFF000  ; physical address bits 51:12
+
+; PML4 layout constants
+PML4_ENTRIES    = 512
+PDPT_ENTRIES    = 512
+PD_ENTRIES      = 512
+PD_ENTRY_SPAN   = 0x200000      ; 2 MB per PD entry
+PD_SPAN         = 0x40000000    ; 1 GB per PD (512 x 2 MB)
+FOUR_GB         = 0x100000000
+
+; -----------------------------------------------------------------------------
+; PTE_PRESENT entry   — set the present bit on the qword at [entry]
+;   CONTRACT
+;     IN        : entry = register holding a PTE address
+;     OUT       : [entry] has bit 0 set
+;     CLOBBERS  : flags; memory at [entry]
+;     ERRORS    : none
+; -----------------------------------------------------------------------------
+macro PTE_PRESENT entry*
+{
+	or	qword [entry], PTE_P_BIT
+}
+
+; -----------------------------------------------------------------------------
+; PTE_WRITABLE entry  — set the read/write bit
+; -----------------------------------------------------------------------------
+macro PTE_WRITABLE entry*
+{
+	or	qword [entry], PTE_RW_BIT
+}
+
+; -----------------------------------------------------------------------------
+; PTE_USER entry      — set the user/supervisor bit (makes the page user)
+; -----------------------------------------------------------------------------
+macro PTE_USER entry*
+{
+	or	qword [entry], PTE_US_BIT
+}
+
+; -----------------------------------------------------------------------------
+; PTE_LARGE entry     — set the page-size bit (marks a PD entry as a 2 MB page)
+; -----------------------------------------------------------------------------
+macro PTE_LARGE entry*
+{
+	or	qword [entry], PTE_PS_BIT
+}
+
+; -----------------------------------------------------------------------------
+; PTE_NX entry        — set the no-execute bit
+; -----------------------------------------------------------------------------
+macro PTE_NX entry*
+{
+	or	qword [entry], PTE_NX_BIT
+}
+
+; -----------------------------------------------------------------------------
+; PTE_ADDR dest, entry  — extract the physical address from a PTE
+;   CONTRACT
+;     IN        : entry = register holding a PTE address
+;     OUT       : dest = physical address (bits 51:12 of the PTE)
+;     CLOBBERS  : dest, flags
+;     ERRORS    : none
+;   AND cannot take a 64-bit immediate, so the mask is applied by shifting
+;   the low flag bits out and back: (x << 12) >> 12 keeps bits 63:12, then
+;   clearing bit 63 (NX) via btr yields the physical address. The kernel's
+;   identity map stays below 4 GB, so bits above 51 are always zero here.
+; -----------------------------------------------------------------------------
+macro PTE_ADDR dest*, entry*
+{
+	mov	dest, [entry]
+	shl	dest, 12		; drop the low 12 flag bits
+	shr	dest, 12		; realign; bits 51:12 now hold the address
+	btr	dest, 63		; clear NX (no-op for the identity map)
+}
+
+; -----------------------------------------------------------------------------
+; PTE_CLEAR entry     — zero a page table entry (marks it not-present)
+; -----------------------------------------------------------------------------
+macro PTE_CLEAR entry*
+{
+	mov	qword [entry], 0
+}
+
+; =============================================================================
+; fp$paging_identity_map_4gb
+;   CONTRACT
+;     IN        : rdi = PML4 base address (4 KB aligned). The layout expected
+;                 is contiguous: PML4 at [rdi], PDPT0..3 at [rdi+0x1000], and
+;                 PD0..3 at [rdi+0x5000] — 9 pages total (0x9000 bytes).
+;     OUT       : rax = 0 on success, negative errno on failure
+;     CLOBBERS  : rax, rcx, rdx, rsi, r8, r9, flags
+;     PRESERVES : rbx, rbp, r12-r15, rdi
+;     ERRORS    : E_ALIGNMENT if rdi is not 4 KB aligned
+;   Sets up the identity mapping for the first 4 GB using 2 MB large pages.
+;   The region [rdi, rdi+0x9000) must be writable and is fully overwritten.
+; =============================================================================
+align 16
+fp$paging_identity_map_4gb:
+	; contract check: PML4 base must be 4 KB aligned
+	mov	rax, rdi
+	and	rax, ALIGN_PAGE - 1
+	jnz	.bad_align
+	; clear the whole 9-page region (PML4 + 4 PDPT + 4 PD)
+	mov	rsi, rdi
+	mov	ecx, (ALIGN_PAGE * 9) shr 3	; qword count, no division
+      .clear:
+	xor	eax, eax
+	mov	[rsi], rax
+	add	rsi, 8
+	dec	ecx
+	jnz	.clear
+	; Correct 4 GB identity map: one PML4 entry, one PDPT. The whole 4 GB
+	; fits under PML4[0] (each PML4 slot spans 512 GB), and PDPT0[0..3] each
+	; point at one PD of 512 x 2 MB large pages.
+	;   PML4[0]     -> PDPT0
+	;   PDPT0[0..3] -> PD0..PD3   (PDn covers [n GB, (n+1) GB))
+	; PML4[0] -> PDPT0 (present, writable, supervisor)
+	mov	rcx, rdi		; PML4 cursor
+	mov	rsi, rdi
+	add	rsi, ALIGN_PAGE		; PDPT0 address
+	mov	rax, rsi
+	or	rax, PTE_P_BIT or PTE_RW_BIT
+	mov	[rcx], rax		; PML4[0]
+	; PDPT0[0..3] -> PD0..3 (present, writable), filling each PD with 512
+	; 2 MB large pages covering [n*1GB, (n+1)*1GB). The PDPT cursor advances
+	; by 8 bytes per entry (one PDPT slot per PD), the PD cursor by a page.
+	mov	rsi, rdi
+	add	rsi, ALIGN_PAGE		; PDPT0 base
+	mov	rcx, rdi
+	add	rcx, ALIGN_PAGE * 5	; PD0 address
+	xor	r8d, r8d		; PD index 0..3
+      .pdpt:
+	mov	rax, rcx
+	or	rax, PTE_P_BIT or PTE_RW_BIT
+	mov	[rsi], rax		; PDPT0[n] -> PDn
+	add	rsi, 8			; next PDPT0 entry (8 bytes)
+	; fill the PD at rcx with 512 large pages
+	mov	r9d, PD_ENTRIES
+	mov	rax, r8
+	shl	rax, 30			; PD index x 1 GB = base physical
+      .pd:
+	mov	rdx, rax
+	or	rdx, PTE_P_BIT or PTE_RW_BIT or PTE_PS_BIT
+	mov	[rcx], rdx		; PD entry: present, writable, 2 MB
+	add	rcx, 8
+	add	rax, PD_ENTRY_SPAN	; next 2 MB physical address
+	dec	r9d
+	jnz	.pd
+	inc	r8d
+	cmp	r8d, 4
+	jb	.pdpt
+	xor	eax, eax		; E_OK
+	ret
+      .bad_align:
+	mov	rax, E_ALIGNMENT
+	ret
+
+; =============================================================================
+; fp$paging_map_range — map a physical range into the boot page tables
+;   CONTRACT
+;     IN        : rdi = physical base address, rsi = length in bytes
+;     OUT       : rax = 0 on success, E_ALIGNMENT if base is not 2 MB aligned
+;                 after rounding down (we round down internally, so always 0)
+;     CLOBBERS  : rax, rcx, rdx, r8, r9, r10, flags
+;     PRESERVES : rbx, rbp, r12-r15, rsi, rdi
+;     ERRORS    : none for the supported case (base below 4 GB)
+;   Maps [base, base+length) using 2 MB large pages in the boot page tables
+;   rooted at PML4_BASE (0x90000): PML4 -> PDPT -> PD -> 2 MB page. Each PD
+;   entry is written present + writable + large-page. The base is rounded DOWN
+;   to a 2 MB boundary and the length is rounded UP to whole 2 MB pages, so a
+;   framebuffer that starts mid-page is fully covered.
+;
+;   Only the first 4 GB are handled (the boot identity map builds PML4[0..3]
+;   and PD0..3). If the base is at or above 4 GB the function is a no-op and
+;   returns E_OUT_OF_RANGE — a safe, detectable answer rather than a partial
+;   map. For QEMU's Bochs BGA (LFB at 0xFD000000) and the T440's VESA modes,
+;   the LFB is below 4 GB.
+;
+;   No division: the PD index is a shift, and the per-GB PD base is found by
+;   shifting the index.
+; =============================================================================
+align 16
+fp$paging_map_range:
+	push	rbx
+	push	r12
+	push	r13
+	push	r14
+	mov	r12, rdi		; r12 = base
+	mov	r13, rsi		; r13 = length
+	; reject a base at or above 4 GB (only PML4[0..3]/PD0..3 exist)
+	mov	rax, r12
+	shr	rax, 32			; high dword
+	jnz	.out_of_range
+	; round base down to a 2 MB boundary
+	mov	rax, r12
+	and	rax, PD_ENTRY_SPAN - 1	; offset within the 2 MB page
+	sub	r12, rax		; r12 = aligned base
+	add	r13, rax		; grow length by the offset we removed
+	; round length up to a whole number of 2 MB pages:
+	;   pages = (length + 2MB - 1) shr 21
+	mov	rax, r13
+	add	rax, PD_ENTRY_SPAN - 1
+	shr	rax, 21			; rax = page count
+	mov	r14, rax		; r14 = pages to map
+	; PD index of the aligned base
+	mov	rbx, r12
+	shr	rbx, 21			; rbx = PD entry index (0..2047)
+      .map_loop:
+	test	r14, r14
+	jz	.done
+	; PD base for this index: PDs are contiguous at 0x95000, 512 entries each.
+	; PDn base = 0x95000 + (index shr 9) * 0x1000 ; entry offset = (index and 511)*8
+	mov	rax, rbx
+	shr	rax, 9			; which PD (0..3)
+	shl	rax, 12			; x 4 KB per PD page
+	add	rax, 0x95000		; PD base (PD0 is at 0x95000)
+	mov	rcx, rbx
+	and	rcx, 511		; entry within the PD
+	shl	rcx, 3			; x 8 bytes per entry
+	add	rax, rcx		; rax = &PD[index]
+	; entry value = physical base of this 2 MB page, present+writable+large
+	mov	rdx, rbx
+	shl	rdx, 21			; physical base = index * 2 MB
+	or	rdx, PTE_P_BIT or PTE_RW_BIT or PTE_PS_BIT
+	mov	[rax], edx		; low dword (below 4 GB)
+	mov	dword [rax + 4], 0	; high dword
+	inc	rbx			; next PD index
+	dec	r14
+	jmp	.map_loop
+      .done:
+	xor	eax, eax
+	pop	r14
+	pop	r13
+	pop	r12
+	pop	rbx
+	ret
+      .out_of_range:
+	mov	rax, E_OUT_OF_RANGE
+	pop	r14
+	pop	r13
+	pop	r12
+	pop	rbx
+	ret
+
+; =============================================================================
+; fp$paging_load_cr3
+;   CONTRACT
+;     IN        : rdi = PML4 base address (4 KB aligned)
+;     OUT       : nothing
+;     CLOBBERS  : rax, flags
+;     PRESERVES : rbx, rbp, r12-r15, rsi, rdi, rcx, rdx
+;     ERRORS    : none
+;   Loads CR3 with the PML4 base, activating this page table. The address is
+;   masked to the address bits (51:12) so flag bits are not set.
+; =============================================================================
+align 16
+fp$paging_load_cr3:
+	mov	rax, rdi
+	; keep only address bits 51:12. AND cannot take a 64-bit immediate, so
+	; shift the low 12 flag bits out and back; the PML4 base is 4 KB aligned
+	; and below 4 GB, so this yields the exact CR3 value.
+	shl	rax, 12
+	shr	rax, 12
+	mov	cr3, rax
+	ret
+
+end if ; FP_PAGING_INC

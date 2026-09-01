@@ -41,6 +41,9 @@ macro_block_line_number dd ?
 macro_symbols dd ?
 struc_name dd ?
 struc_label dd ?
+qword_op_in32 db ?	; FASM_PLUS: 1 = qword operand in 32-bit code is allowed
+			; (set by push/pop operand-size dispatch, cleared per
+			; instruction); permits r64 addressing for those ops
 instant_macro_start dd ?
 parameters_end dd ?
 default_argument_value dd ?

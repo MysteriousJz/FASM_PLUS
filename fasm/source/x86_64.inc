@@ -2,6 +2,17 @@
 ; flat assembler core
 ; Copyright (c) 1999-2022, Tomasz Grysztar.
 ; All rights reserved.
+;
+; FASM_PLUS OS-core extension (REX.W plumbing for 32-bit code sections):
+; A 32-bit code section may need to emit a small amount of 64-bit machine
+; code (the classic example is a Multiboot2 boot stub that switches to long
+; mode and then falls through into the 64-bit half of the same section).
+; The encoder therefore allows rex_prefix bits in 32-bit code as long as
+; they do not name extended registers (R8-R15), and it accepts 64-bit GPR
+; push/pop and movsxd in 32-bit code, encoding them with REX.W. (OS_TEST.ASM
+; defines PUSHAQ/POPAQ as ordinary FASM macros on top of this.) These
+; encodings only execute correctly once the CPU is in 64-bit mode; the
+; assembler trusts the author, per the Literal Transparency philosophy.
 
 simple_instruction_except64:
 	cmp	[code_type],64
@@ -9,6 +20,9 @@ simple_instruction_except64:
 simple_instruction:
 	stos	byte [edi]
 	jmp	instruction_assembled
+simple_instruction_anymode:
+	; FASM_PLUS: emits the opcode unchanged in every code type
+	jmp	simple_instruction
 simple_instruction_only64:
 	cmp	[code_type],64
 	jne	illegal_instruction
@@ -1213,10 +1227,23 @@ push_instruction:
 	je	push_imm
 	cmp	al,'['
 	jne	invalid_operand
+	; FASM_PLUS: qword memory operand in 32-bit code must be announced
+	; before get_address so r64 addressing validates; the address-size
+	; prefix shares operand_size, so it is forced to 8 afterwards
+	cmp	[operand_size],8
+	jne	push_mem
+	cmp	[code_type],64
+	je	push_mem
+	or	[qword_op_in32],1
+	mov	[push_size],8
       push_mem:
 	call	get_address
 	mov	al,[operand_size]
 	mov	ah,[push_size]
+	cmp	[qword_op_in32],0
+	je	push_mem_size_ok
+	mov	al,8			; qword push in 32-bit code
+      push_mem_size_ok:
 	cmp	al,2
 	je	push_mem_16bit
 	cmp	al,4
@@ -1249,7 +1276,10 @@ push_instruction:
 	test	ah,not 8
 	jnz	invalid_operand_size
 	cmp	[code_type],64
-	jne	illegal_instruction
+	je	push_mem_store
+	; FASM_PLUS: accept qword push in 32-bit code, encoded with REX.W
+	mov	[operand_size],8
+	call	operand_64bit_in32
       push_mem_store:
 	mov	[base_code],0FFh
 	mov	[postbyte_register],110b
@@ -1282,7 +1312,9 @@ push_instruction:
 	test	ah,not 8
 	jnz	invalid_operand_size
 	cmp	[code_type],64
-	jne	illegal_instruction
+	je	push_reg_store
+	; FASM_PLUS: accept 64-bit GPR push in 32-bit code, encoded with REX.W
+	call	operand_64bit_in32
 	jmp	push_reg_store
       push_reg_32bit:
 	test	ah,not 4
@@ -1358,6 +1390,19 @@ push_instruction:
       push_imm:
 	mov	al,[operand_size]
 	mov	ah,[push_size]
+	; FASM_PLUS: a REX.W announcement left over from a qword memory push
+	; on the same line must not force an 8-byte immediate; the CPU
+	; treats the push immediate as a sign-extended imm32 regardless.
+	cmp	al,8
+	jne	push_imm_size_checked
+	cmp	[code_type],64
+	je	push_imm_size_checked
+	test	[rex_prefix],48h
+	jz	push_imm_size_checked
+	and	[operand_size],0
+	and	[rex_prefix],not 48h
+	xor	al,al
+      push_imm_size_checked:
 	or	al,al
 	je	push_imm_size_ok
 	or	ah,ah
@@ -1476,10 +1521,22 @@ pop_instruction:
 	je	pop_reg
 	cmp	al,'['
 	jne	invalid_operand
+	; FASM_PLUS: qword memory operand in 32-bit code must be announced
+	; before get_address so r64 addressing validates
+	cmp	[operand_size],8
+	jne	pop_mem
+	cmp	[code_type],64
+	je	pop_mem
+	or	[qword_op_in32],1
+	mov	[push_size],8
       pop_mem:
 	call	get_address
 	mov	al,[operand_size]
 	mov	ah,[push_size]
+	cmp	[qword_op_in32],0
+	je	pop_mem_size_ok
+	mov	al,8			; qword pop in 32-bit code
+      pop_mem_size_ok:
 	cmp	al,2
 	je	pop_mem_16bit
 	cmp	al,4
@@ -1512,7 +1569,10 @@ pop_instruction:
 	test	ah,not 8
 	jnz	invalid_operand_size
 	cmp	[code_type],64
-	jne	illegal_instruction
+	je	pop_mem_store
+	; FASM_PLUS: accept qword pop in 32-bit code, encoded with REX.W
+	mov	[operand_size],8
+	call	operand_64bit_in32
       pop_mem_store:
 	mov	[base_code],08Fh
 	mov	[postbyte_register],0
@@ -1546,7 +1606,9 @@ pop_instruction:
 	test	ah,not 8
 	jnz	invalid_operand_size
 	cmp	[code_type],64
-	jne	illegal_instruction
+	je	pop_reg_store
+	; FASM_PLUS: accept 64-bit GPR pop in 32-bit code, encoded with REX.W
+	call	operand_64bit_in32
 	jmp	pop_reg_store
       pop_reg_32bit:
 	test	ah,not 4
@@ -2274,6 +2336,39 @@ movsxd_instruction:
 	jne	invalid_operand_size
 	mov	bl,al
 	call	operand_64bit
+	jmp	nomem_instruction_ready
+; FASM_PLUS: `movsxd64 r64, r/m32` (see tables.inc) is the 32-bit-section
+; spelling of movsxd. It encodes with REX.W so the instruction becomes the
+; real movsxd once the CPU is in long mode. The dword source-size prefix
+; shares operand_size, so it is cleared before get_address, and the REX.W
+; announcement happens up front so r64 addressing validates.
+movsxd32_instruction:
+	mov	[base_code],al
+	call	take_register
+	mov	[postbyte_register],al
+	cmp	ah,8
+	jne	invalid_operand_size
+	lods	byte [esi]
+	cmp	al,','
+	jne	invalid_operand
+	and	dword [operand_size],0
+	lods	byte [esi]
+	call	get_size_operator
+	cmp	al,10h
+	je	movsxd32_reg
+	cmp	al,'['
+	jne	invalid_operand
+	and	dword [operand_size],0
+	call	operand_64bit_in32
+	call	get_address
+	jmp	instruction_ready
+      movsxd32_reg:
+	lods	byte [esi]
+	call	convert_register
+	cmp	ah,4
+	jne	invalid_operand_size
+	mov	bl,al
+	call	operand_64bit_in32
 	jmp	nomem_instruction_ready
 bt_instruction:
 	mov	[postbyte_register],al
@@ -6726,7 +6821,13 @@ get_size_operator:
 	cmp	ah,[operand_size]
 	je	size_operator_ok
 	cmp	[operand_size],0
-	jne	operand_sizes_do_not_match
+	je	size_operator_store
+	; FASM_PLUS: a qword size prefix before an address in 32-bit code
+	; (qword push/pop) is an address size, not an operand-size mismatch
+	cmp	[qword_op_in32],0
+	jne	size_operator_ok
+	jmp	operand_sizes_do_not_match
+      size_operator_store:
 	mov	[operand_size],ah
       size_operator_ok:
 	ret
@@ -6762,7 +6863,15 @@ get_address:
 	or	bx,bx
 	jnz	clear_address_size
 	cmp	[code_type],64
+	je	calculate_relative_address
+	; FASM_PLUS: for announced 64-bit operations in 32-bit code (REX.W
+	; or qword push/pop), skip clear_address_size so the r64 register
+	; class survives to store_instruction's postbyte dispatch.
+	test	[rex_prefix],48h
+	jnz	address_ok
+	cmp	[qword_op_in32],0
 	jne	address_ok
+	jmp	address_ok
       calculate_relative_address:
 	mov	edx,[address_symbol]
 	mov	[symbol_identifier],edx
@@ -6811,8 +6920,17 @@ get_address_prefixes:
 	mov	[value_size],al
 	or	[address_size_declared],1
 	or	[address_size],al
-	cmp	al,[address_size]
+	; FASM_PLUS: the address-size prefix shares the operand_size field;
+	; a qword push/pop in 32-bit code announces itself via
+	; qword_op_in32 before get_address runs, so the 8 here is an
+	; address size, not an operand-size mismatch.
+	cmp	[qword_op_in32],0
+	jne	address_size_prefix_ok
+	cmp	al,[operand_size]
+	je	address_size_prefix_ok
+	cmp	[operand_size],0
 	jne	invalid_address_size
+	mov	[operand_size],al
       address_size_prefix_ok:
 	ret
 operand_16bit:
@@ -6829,6 +6947,14 @@ operand_32bit:
 operand_64bit:
 	cmp	[code_type],64
 	jne	illegal_instruction
+	or	[rex_prefix],48h
+	ret
+operand_64bit_in32:
+	; FASM_PLUS: like operand_64bit, but for use inside 32-bit code
+	; sections (long-mode code embedded in a boot stub). Sets REX.W
+	; without requiring code_type 64; extended registers (REX.R/X/B,
+	; set by convert_register/get_address) are still rejected later by
+	; the "disallowed combination of registers" check in non-64 code.
 	or	[rex_prefix],48h
 	ret
 operand_autodetect:
@@ -6904,7 +7030,15 @@ store_classic_instruction_code:
 	test	al,40h
 	jz	rex_prefix_ok
 	cmp	[code_type],64
-	jne	invalid_operand
+	je	rex_prefix_allowed
+	; FASM_PLUS: in non-64 code accept a REX prefix only when it carries
+	; no extended-register bits (R/X/B). REX.W in 32-bit code encodes the
+	; 64-bit operation used by embedded long-mode stubs.
+	test	al,0B0h
+	jnz	disallowed_combination_of_registers
+	test	al,7
+	jnz	invalid_operand
+      rex_prefix_allowed:
 	test	al,0B0h
 	jnz	disallowed_combination_of_registers
 	stos	byte [edi]
@@ -6970,7 +7104,14 @@ store_instruction:
 	and	[postbyte_register],111b
       reg_code_ok:
 	cmp	[code_type],64
-	jne	address_value_ok
+	je	address_high_check
+	; FASM_PLUS: 64-bit absolute addressing embedded in 32-bit code
+	; (announced via rex_prefix by operand_64bit_in32) must not trip the
+	; address_high range check below; skip it in that case only.
+	test	[rex_prefix],40h
+	jnz	address_value_ok
+	jmp	address_value_ok
+      address_high_check:
 	xor	eax,eax
 	bt	edx,31
 	sbb	eax,[address_high]
@@ -7126,7 +7267,30 @@ store_instruction:
 	jmp	address_prefix_ok
       postbyte_64bit:
 	cmp	[code_type],64
-	jne	invalid_address_size
+	je	address_prefix_ok
+	; FASM_PLUS: permit a 64-bit register address in 32-bit code when the
+	; instruction announced 64-bit operation. The 64-bit ModRM/SIB
+	; encoding is identical to 32-bit for r0-r7; only base registers
+	; that need no SIB byte (rax rcx rdx rbx rsi rdi) are accepted, so
+	; the emitted code is safe. Announced via REX.W (operand_64bit_in32)
+	; or by the qword push/pop r/m64 opcodes (base_code FFh/8Fh).
+	test	[rex_prefix],48h
+	jnz	postbyte_64bit_in32
+	cmp	[qword_op_in32],0		; qword push/pop r/m64
+	je	invalid_address_size
+      postbyte_64bit_in32:
+	; bx holds base/index class+number (e.g. 8383 for [rbx]); the base
+	; lives in bh and any index in bl, so validate the base only.
+	mov	al,bh
+	and	al,0F8h
+	cmp	al,80h
+	jne	invalid_address_size		; not a plain r64 base
+	cmp	bh,84h
+	je	invalid_address_size		; rsp/r12 needs a SIB byte
+	cmp	bh,88h
+	jae	invalid_address_size		; r8+ would need REX.B
+	or	cl,cl
+	jnz	invalid_address_size		; no scaled index
       address_prefix_ok:
 	cmp	bl,44h
 	je	invalid_address
@@ -7239,7 +7403,17 @@ store_instruction:
 	test	ch,44h or 88h
 	jnz	simple_address_32bit_value
 	or	ch,ch
-	jnz	address_sizes_do_not_agree
+	jz	only_base_displacement_ok
+	; FASM_PLUS: a 64-bit register address in 32-bit code (announced qword
+	; op) keeps the 32-bit displacement tag in ch; that tag is harmless
+	; for r0-r7 bases, so accept it instead of raising an error.
+	cmp	[code_type],64
+	je	address_sizes_do_not_agree
+	test	[rex_prefix],48h
+	jnz	only_base_displacement_ok
+	cmp	[qword_op_in32],0
+	je	address_sizes_do_not_agree
+      only_base_displacement_ok:
 	or	edx,edx
 	jz	simple_address
 	cmp	[displacement_compression],2

@@ -1562,7 +1562,23 @@ get_address_value:
 	and	ah,0Fh
 	jz	address_registers_sizes_ok
 	cmp	al,ah
+	je	address_registers_sizes_ok
+	; FASM_PLUS: in 32-bit code, permit a 64-bit register address when
+	; the instruction announced 64-bit operation (REX.W set by
+	; operand_64bit_in32, or qword push/pop via qword_op_in32). The
+	; 64-bit ModRM encoding is identical to 32-bit for r0-r7.
+	cmp	[code_type],64
+	je	invalid_address
+	test	[rex_prefix],48h
+	jnz	address_qword_in32_ok
+	cmp	[qword_op_in32],0		; qword push/pop r/m64
+	je	invalid_address
+      address_qword_in32_ok:
+	cmp	al,8
 	jne	invalid_address
+	; announce 64-bit addressing so the displacement tag is 64-bit
+	mov	ah,8
+	mov	ch,88h
       address_registers_sizes_ok:
 	cmp	al,4
 	je	sib_allowed

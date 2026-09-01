@@ -1,0 +1,34 @@
+ThinkPad T440 Hardware Profile
+===============================
+
+CPU: Intel Core i5-4300U
+- 2 cores, 4 threads
+- 1.9 GHz base, 2.9 GHz turbo
+- Haswell microarchitecture
+- Supports: SSE4.2, AVX2, BMI2, VMX
+
+Chipset: Intel 8 Series (Lynx Point)
+- PCIe 2.0
+- SATA 3.0 (6 Gbps)
+- USB 3.0
+- Intel HD Audio
+
+Keyboard: PS/2 (internal)
+- Standard 8042 controller
+- IRQ 1
+- Scancode Set 2
+
+Display: Intel HD Graphics 4400
+- VESA-compatible framebuffer
+- Up to 1600×900 (T440 panel)
+
+Disk: SATA
+- AHCI controller
+- Standard SATA 3.0
+
+Ethernet: Intel i218-LM
+- PCIe
+- Standard Intel Ethernet
+
+Audio: Intel HDA
+- Standard HDA controller
